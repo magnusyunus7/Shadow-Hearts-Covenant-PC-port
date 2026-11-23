@@ -1,0 +1,61 @@
+# =====================================================================
+#  WHITELIST: this repo lives in the working folder (C:\shc) next to the
+#  ISO, the extracted disc, the PS2Recomp checkout with recompiled game
+#  code, logs and test zips. Everything is ignored by default; only the
+#  folders below are tracked. Add new top-level entries here on purpose.
+# =====================================================================
+
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/LICENSE
+!/docs/
+!/config/
+!/patches/
+!/scripts/
+!/screenshots/
+
+# ---------------------------------------------------------------------
+#  Safety net inside the tracked folders: never game data or anything
+#  derived from it, even if someone drops it in by mistake.
+# ---------------------------------------------------------------------
+*.iso
+*.ISO
+*.chd
+*.cue
+*.img
+SLUS_*
+SCUS_*
+SYSTEM.CNF
+*.PKB
+*.pkb
+*.TBL
+*.tbl
+*.BIN
+*.IRX
+*.irx
+*.elf
+*.ELF
+sub_*.cpp
+entry_*.cpp
+zz_ovl_*
+register_functions.cpp
+ps2_recompiled_functions.h
+ps2_recompiled_stubs.h
+out/
+out_*/
+ram*.bin
+*.raw
+mc0/
+mc1/
+
+# Tool output and build junk
+*.log
+*.zip
+*.7z
+*.exe
+*.pdb
+*.obj
+__pycache__/
+*.pyc

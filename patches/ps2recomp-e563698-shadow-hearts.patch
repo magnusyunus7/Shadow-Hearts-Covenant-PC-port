@@ -1,0 +1,1703 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81..7766f2a 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -31,6 +31,8 @@ namespace ps2x::iop
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
++        // EE->IOP SIF command (sceSifSendCmd on the EE). False if no IOP handler is registered.
++        [[nodiscard]] bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
+diff --git a/ps2xIOP/include/ps2x/iop/sif_diag.h b/ps2xIOP/include/ps2x/iop/sif_diag.h
+new file mode 100644
+index 0000000..a3806a1
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/sif_diag.h
+@@ -0,0 +1,30 @@
++#pragma once
++// Opt-in SIF/IOP diagnostics. Enable by setting the environment variable PS2X_SIFDIAG=1.
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++
++namespace ps2x::iop
++{
++    inline bool sifDiagEnabled() noexcept
++    {
++        static const bool enabled = [] {
++            const char *v = std::getenv("PS2X_SIFDIAG");
++            return v && *v && *v != '0';
++        }();
++        return enabled;
++    }
++
++    inline void sifDiag(const char *fmt, ...) noexcept
++    {
++        if (!sifDiagEnabled())
++            return;
++        std::va_list args;
++        va_start(args, fmt);
++        std::fputs("[sifdiag] ", stderr);
++        std::vfprintf(stderr, fmt, args);
++        std::fputc('\n', stderr);
++        std::fflush(stderr);
++        va_end(args);
++    }
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.cpp b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+index 3d80897..fd77feb 100644
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_timrman.h"
++#include "ps2x/iop/sif_diag.h"
+ 
+ #include "../core/iop_cpu.h"
+ #include "../services/iop_rpc.h"
+@@ -167,6 +168,7 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         case 4: // AllocHardTimer
++            ps2x::iop::sifDiag("IOP timrman AllocHardTimer a0=0x%x a1=0x%x a2=0x%x a3=0x%x", cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]);
+             for (const size_t index : kAllocationOrder)
+             {
+                 Timer &timer = m_timers[index];
+@@ -306,6 +308,7 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         case 20: // SetTimerHandler
++            ps2x::iop::sifDiag("IOP timrman SetTimerHandler a0=0x%x a1=0x%x a2=0x%x a3=0x%x", cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]);
+         case 21: // SetOverflowHandler
+         {
+             Timer *timer = timerFromId(a0);
+@@ -332,6 +335,7 @@ namespace ps2x::iop::detail
+             return true;
+         }
+         case 22: // SetupHardTimer
++            ps2x::iop::sifDiag("IOP timrman SetupHardTimer a0=0x%x a1=0x%x a2=0x%x a3=0x%x", cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]);
+         {
+             Timer *timer = timerFromId(a0);
+             if (!timer)
+@@ -367,6 +371,7 @@ namespace ps2x::iop::detail
+             return true;
+         }
+         case 23: // StartHardTimer
++            ps2x::iop::sifDiag("IOP timrman StartHardTimer a0=0x%x a1=0x%x a2=0x%x a3=0x%x", cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]);
+         {
+             Timer *timer = timerFromId(a0);
+             if (!timer)
+@@ -438,6 +443,12 @@ namespace ps2x::iop::detail
+             const Callback callback = compareDue ? timer.compareCallback : timer.overflowCallback;
+             timer.compareCycle = UINT64_MAX;
+             timer.overflowCycle = UINT64_MAX;
++            {
++                static uint64_t fires = 0;
++                ++fires;
++                if (fires <= 5 || (fires % 1000u) == 0u)
++                    ps2x::iop::sifDiag("IOP timer callback #%llu fn=0x%x", static_cast<unsigned long long>(fires), callback.function);
++            }
+             const uint32_t result = callback.function != 0u
+                                         ? executor.executeGuestFunctionWithBudget(callback.function,
+                                                                                   callback.common,
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..ea9ec9f 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,4 +1,7 @@
+ #include "iop_emulator.h"
++#include "ps2x/iop/sif_diag.h"
++#include <map>
++#include <utility>
+ #include "imports/iop_cdvd.h"
+ #include "core/iop_cpu.h"
+ #include "imports/iop_heaplib.h"
+@@ -91,6 +94,9 @@ namespace ps2x::iop::detail
+             uint32_t function = 0u;
+             uint32_t gp = 0u;
+             uint32_t argument = 0u;
++            // thbase SetAlarm/iSetAlarm: a non-zero handler return re-arms the alarm after that
++            // many system-clock ticks (IOP cycles), and CancelAlarm can remove it.
++            bool alarm = false;
+         };
+ 
+         explicit Impl(IopHost &hostRef)
+@@ -238,6 +244,24 @@ namespace ps2x::iop::detail
+         };
+ 
+         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
++        {
++            if (!ps2x::iop::sifDiagEnabled())
++                return dispatchImportInner(call, cpu);
++            const uint32_t ra = cpu.gpr[31], a0 = cpu.gpr[4], a1 = cpu.gpr[5], a2 = cpu.gpr[6], a3 = cpu.gpr[7];
++            const ImportDisposition result = dispatchImportInner(call, cpu);
++            static std::map<std::pair<std::string, uint16_t>, int> seen;
++            static const char *watched[] = {"libsd", "cdvdman", "thbase", "threadman", "thsemap", "thevent", "sifman", "ioman", "intrman", "sysmem"};
++            bool watch = result == ImportDisposition::Missing;
++            for (const char *w : watched)
++                watch = watch || iequals(call.library, w);
++            if (watch && ++seen[{call.library, call.ordinal}] <= 6)
++                ps2x::iop::sifDiag("IOP import %s#%u ra=0x%x a0=0x%x a1=0x%x a2=0x%x a3=0x%x -> v0=0x%x%s",
++                                   call.library.c_str(), call.ordinal, ra, a0, a1, a2, a3, cpu.gpr[2],
++                                   result == ImportDisposition::Missing ? " MISSING" : "");
++            return result;
++        }
++
++        ImportDisposition dispatchImportInner(const IopImportCall &call, CpuState &cpu)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+             auto setV0 = [&](uint32_t value)
+@@ -266,6 +290,57 @@ namespace ps2x::iop::detail
+             if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+ 
++            if (iequals(call.library, "sifman") && call.ordinal == 32u)
++            {
++                // sceSifSetDmaIntr(transfers, count, callback, arg): the sceSifSetDma (#7) transfer
++                // plus a completion callback, delivered like the SIF DMA-end interrupt.
++                const uint32_t callbackFn = cpu.gpr[6];
++                const uint32_t callbackArg = cpu.gpr[7];
++                const uint32_t gp = cpu.gpr[28];
++                (void)rpc.dispatchSifManImport(7u, cpu);
++                const uint32_t dmaId = cpu.gpr[2];
++                if (dmaId != 0u && callbackFn != 0u)
++                {
++                    ScheduledGuestCallback done;
++                    done.function = callbackFn;
++                    done.argument = callbackArg;
++                    done.gp = gp;
++                    pendingGuestCallbacks.emplace(totalCycles + 64u, done);
++                }
++                return ImportDisposition::Handled;
++            }
++            if ((iequals(call.library, "thbase") || iequals(call.library, "threadman")) &&
++                call.ordinal >= 35u && call.ordinal <= 38u)
++            {
++                if (call.ordinal <= 36u) // SetAlarm / iSetAlarm(const iop_sys_clock_t *clock, handler, common)
++                {
++                    const uint64_t ticks = static_cast<uint64_t>(memory.read32(cpu.gpr[4])) |
++                                           (static_cast<uint64_t>(memory.read32(cpu.gpr[4] + 4u)) << 32u);
++                    ScheduledGuestCallback alarm;
++                    alarm.function = cpu.gpr[5];
++                    alarm.argument = cpu.gpr[6];
++                    alarm.gp = cpu.gpr[28];
++                    alarm.alarm = true;
++                    pendingGuestCallbacks.emplace(totalCycles + std::max<uint64_t>(ticks, 1u), alarm);
++                    setV0(0u);
++                }
++                else // CancelAlarm / iCancelAlarm(handler, common)
++                {
++                    bool found = false;
++                    for (auto it = pendingGuestCallbacks.begin(); it != pendingGuestCallbacks.end();)
++                    {
++                        if (it->second.alarm && it->second.function == cpu.gpr[4] && it->second.argument == cpu.gpr[5])
++                        {
++                            it = pendingGuestCallbacks.erase(it);
++                            found = true;
++                        }
++                        else
++                            ++it;
++                    }
++                    setV0(found ? 0u : static_cast<uint32_t>(-151)); // KE_NOTFOUND_HANDLER
++                }
++                return ImportDisposition::Handled;
++            }
+             if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
+             {
+                 return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
+@@ -535,13 +610,21 @@ namespace ps2x::iop::detail
+                 {
+                     if (callback.function != 0u)
+                     {
+-                        (void)callFunction(callback.function,
+-                                           callback.argument,
+-                                           0u,
+-                                           0u,
+-                                           0u,
+-                                           callback.gp,
+-                                           100000u);
++                        const uint32_t rearm = callFunction(callback.function,
++                                                            callback.argument,
++                                                            0u,
++                                                            0u,
++                                                            0u,
++                                                            callback.gp,
++                                                            100000u);
++                        if (callback.alarm)
++                        {
++                            static int alarmDiag = 0;
++                            if (++alarmDiag <= 8)
++                                ps2x::iop::sifDiag("IOP alarm fired fn=0x%x common=0x%x -> rearm %u", callback.function, callback.argument, rearm);
++                            if (rearm != 0u)
++                                pendingGuestCallbacks.emplace(totalCycles + rearm, callback);
++                        }
+                     }
+                 }
+             }
+@@ -753,6 +836,11 @@ namespace ps2x::iop::detail
+         return m_impl->rpc.handleRpc(request, *m_impl);
+     }
+ 
++    bool IopEmulator::deliverEeSifCommand(uint32_t commandId, const void *packet, size_t packetSize)
++    {
++        return m_impl->rpc.deliverEeCommand(commandId, packet, packetSize, *m_impl);
++    }
++
+     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept
+     {
+         return m_impl->rpc.hasServer(sid);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 01b48df..cf8c926 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -27,6 +27,7 @@ namespace ps2x::iop::detail
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
++        [[nodiscard]] bool deliverEeSifCommand(uint32_t commandId, const void *packet, size_t packetSize);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..b09bee6 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -1,4 +1,7 @@
+ #include "iop_rpc.h"
++#include "ps2x/iop/sif_diag.h"
++#include <cstdio>
++#include <string>
+ 
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_kernel.h"
+@@ -11,6 +14,24 @@
+ #include <limits>
+ #include <vector>
+ 
++
++namespace
++{
++    void sifDiagHex(const char *tag, const uint8_t *p, size_t n)
++    {
++        if (!ps2x::iop::sifDiagEnabled())
++            return;
++        char line[3 * 128 + 1] = {};
++        size_t o = 0;
++        for (size_t i = 0; i < n && i < 128; ++i)
++            o += static_cast<size_t>(std::snprintf(line + o, sizeof(line) - o, "%02x%s", p[i], (i % 4 == 3) ? " " : ""));
++        std::string ascii;
++        for (size_t i = 16; i < n && i < 128; ++i)
++            ascii += (p[i] >= 32 && p[i] < 127) ? static_cast<char>(p[i]) : '.';
++        ps2x::iop::sifDiag("  %s [%zu] %s |%s|", tag, n, line, ascii.c_str());
++    }
++}
++
+ namespace ps2x::iop::detail
+ {
+     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
+@@ -21,6 +42,12 @@ namespace ps2x::iop::detail
+     void IopRpcBridge::reset()
+     {
+         m_servers.clear();
++        m_cmdHandlers.clear();
++        m_cmdPacketBuffer = 0u;
++        m_userCmdTable = 0u;
++        m_userCmdTableSize = 0u;
++        m_sysCmdTable = 0u;
++        m_sysCmdTableSize = 0u;
+         m_nextDmaId = 1u;
+         m_sifInitialized = false;
+     }
+@@ -139,14 +166,46 @@ namespace ps2x::iop::detail
+         };
+         switch (ordinal)
+         {
++        case 10: // sceSifAddCmdHandler(cid, handler, data)
++        {
++            CmdHandler handler;
++            handler.function = cpu.gpr[5];
++            handler.data = cpu.gpr[6];
++            handler.gp = cpu.gpr[28];
++            m_cmdHandlers[cpu.gpr[4]] = handler;
++            writeGuestCmdEntry(cpu.gpr[4], handler.function, handler.data);
++            ps2x::iop::sifDiag("IOP sceSifAddCmdHandler cid=0x%x handler=0x%x data=0x%x gp=0x%x", cpu.gpr[4], handler.function, handler.data, handler.gp);
++            setV0(0);
++            return true;
++        }
++        case 11: // sceSifRemoveCmdHandler(cid)
++            m_cmdHandlers.erase(cpu.gpr[4]);
++            writeGuestCmdEntry(cpu.gpr[4], 0u, 0u);
++            setV0(0);
++            return true;
++        case 8: // sceSifSetCmdBuffer(table, count) -> previous table
++        case 9: // sceSifSetSysCmdBuffer(table, count) -> previous table
++        {
++            uint32_t &table = (ordinal == 8) ? m_userCmdTable : m_sysCmdTable;
++            uint32_t &size = (ordinal == 8) ? m_userCmdTableSize : m_sysCmdTableSize;
++            const uint32_t previous = table;
++            table = cpu.gpr[4];
++            size = cpu.gpr[5];
++            ps2x::iop::sifDiag("IOP %s table=0x%x count=%u", ordinal == 8 ? "sceSifSetCmdBuffer" : "sceSifSetSysCmdBuffer", table, size);
++            // Carry already-registered handlers into the new table, as they would live there.
++            for (const auto &entry : m_cmdHandlers)
++            {
++                const bool isSystem = (entry.first & 0x80000000u) != 0u;
++                if (isSystem == (ordinal == 9))
++                    writeGuestCmdEntry(entry.first, entry.second.function, entry.second.data);
++            }
++            setV0(previous);
++            return true;
++        }
+         case 4: // InitCmd
+         case 5:
+         case 6:
+         case 7:
+-        case 8:
+-        case 9:
+-        case 10:
+-        case 11:
+         case 14: // InitRpc
+         case 15:
+         case 16:
+@@ -197,7 +256,21 @@ namespace ps2x::iop::detail
+             std::memcpy(packet.data() + 4u, &extraDestination, sizeof(extraDestination));
+             std::memcpy(packet.data() + 8u, &commandId, sizeof(commandId));
+ 
+-            if (!m_host.sendSifCommand(commandId, packet.data(), packetSize))
++            const bool eeAccepted = m_host.sendSifCommand(commandId, packet.data(), packetSize);
++            {
++                static int diagCount = 0;
++                if (diagCount < 64)
++                {
++                    ++diagCount;
++                    uint32_t w3 = 0;
++                    std::memcpy(&w3, packet.data() + 12u, sizeof(w3));
++                    ps2x::iop::sifDiag("IOP %s cid=0x%x psize=0x%x word3=0x%x -> EE %s",
++                                       ordinal == 13 ? "isceSifSendCmd" : "sceSifSendCmd",
++                                       commandId, packetSize, w3, eeAccepted ? "handler queued" : "REJECTED");
++                    sifDiagHex("IOP->EE", packet.data(), packetSize);
++                }
++            }
++            if (!eeAccepted)
+             {
+                 // A command without an EE handler is still a completed DMA on  real hardware. Only malformed packets fail above.
+             }
+@@ -320,6 +393,81 @@ namespace ps2x::iop::detail
+         return result;
+     }
+ 
++    void IopRpcBridge::writeGuestCmdEntry(uint32_t cid, uint32_t function, uint32_t data)
++    {
++        const bool isSystem = (cid & 0x80000000u) != 0u;
++        const uint32_t index = cid & 0x7FFFFFFFu;
++        const uint32_t table = isSystem ? m_sysCmdTable : m_userCmdTable;
++        const uint32_t size = isSystem ? m_sysCmdTableSize : m_userCmdTableSize;
++        if (table == 0u || index >= size || !m_memory.ownsRamRange(table + index * 8u, 8u))
++            return;
++        m_memory.write32(table + index * 8u, function);
++        m_memory.write32(table + index * 8u + 4u, data);
++    }
++
++    bool IopRpcBridge::deliverEeCommand(uint32_t commandId,
++                                        const void *packet,
++                                        size_t packetSize,
++                                        IopGuestExecutor &executor)
++    {
++        constexpr size_t kHeaderSize = 16u;
++        constexpr size_t kMaxPacketSize = 128u;
++        if (!packet || packetSize < kHeaderSize || packetSize > kMaxPacketSize)
++            return false;
++
++        // Prefer the guest table when one is set: that is where real sifcmd looks.
++        {
++            const bool isSystem = (commandId & 0x80000000u) != 0u;
++            const uint32_t index = commandId & 0x7FFFFFFFu;
++            const uint32_t table = isSystem ? m_sysCmdTable : m_userCmdTable;
++            const uint32_t size = isSystem ? m_sysCmdTableSize : m_userCmdTableSize;
++            if (table != 0u && index < size && m_memory.ownsRamRange(table + index * 8u, 8u))
++            {
++                const uint32_t fn = m_memory.read32(table + index * 8u);
++                const uint32_t data = m_memory.read32(table + index * 8u + 4u);
++                if (fn != 0u)
++                {
++                    auto known = m_cmdHandlers.find(commandId);
++                    CmdHandler h;
++                    h.function = fn;
++                    h.data = data;
++                    h.gp = (known != m_cmdHandlers.end() && known->second.function == fn) ? known->second.gp : 0u;
++                    m_cmdHandlers[commandId] = h;
++                }
++            }
++        }
++        // Real sifcmd keys user commands by the low bits; system commands keep bit 31.
++        auto handlerIt = m_cmdHandlers.find(commandId);
++        if (handlerIt == m_cmdHandlers.end())
++            handlerIt = m_cmdHandlers.find(commandId & 0x7FFFFFFFu);
++        if (handlerIt == m_cmdHandlers.end() || handlerIt->second.function == 0u)
++        {
++            ps2x::iop::sifDiag("EE->IOP cmd cid=0x%x: no IOP handler (registered: %zu)", commandId, m_cmdHandlers.size());
++            return false;
++        }
++
++        // sifcmd receives packets into its own buffer; emulate that with one IOP allocation.
++        if (m_cmdPacketBuffer == 0u)
++            m_cmdPacketBuffer = m_memory.allocate(static_cast<uint32_t>(kMaxPacketSize), 16u);
++        if (m_cmdPacketBuffer == 0u || !m_memory.writeRam(m_cmdPacketBuffer, packet, packetSize))
++            return false;
++
++        const CmdHandler handler = handlerIt->second;
++        {
++            uint32_t w3 = 0;
++            std::memcpy(&w3, static_cast<const uint8_t *>(packet) + 12u, sizeof(w3));
++            ps2x::iop::sifDiag("EE->IOP cmd cid=0x%x -> IOP handler 0x%x (packet @0x%x, word3=0x%x)", commandId, handler.function, m_cmdPacketBuffer, w3);
++            sifDiagHex("EE->IOP", static_cast<const uint8_t *>(packet), packetSize);
++        }
++        (void)executor.executeGuestFunction(handler.function,
++                                            m_cmdPacketBuffer,
++                                            handler.data,
++                                            0u,
++                                            0u,
++                                            handler.gp);
++        return true;
++    }
++
+     void IopRpcBridge::onSifTransfer(const SifTransfer &transfer)
+     {
+         // The EE SIF transport owns the actual directional memory movement.
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index a4286ba..2a9d5c2 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -49,6 +49,12 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
++        // Deliver an EE->IOP SIF command packet to the handler an IOP module registered with
++        // sifcmd sceSifAddCmdHandler. Returns false if no handler is registered for the id.
++        [[nodiscard]] bool deliverEeCommand(uint32_t commandId,
++                                            const void *packet,
++                                            size_t packetSize,
++                                            IopGuestExecutor &executor);
+         void onSifTransfer(const SifTransfer &transfer);
+         void removeServersInRange(uint32_t base, uint32_t size);
+ 
+@@ -68,10 +74,27 @@ namespace ps2x::iop::detail
+             uint32_t queue = 0;
+         };
+ 
++        struct CmdHandler
++        {
++            uint32_t function = 0;
++            uint32_t data = 0;
++            uint32_t gp = 0;
++        };
++
+         IopHost &m_host;
+         IopMemory &m_memory;
+         IopKernel &m_kernel;
+         std::unordered_map<uint32_t, RpcServer> m_servers;
++        std::unordered_map<uint32_t, CmdHandler> m_cmdHandlers;
++        // Guest handler tables set with sceSifSetCmdBuffer / sceSifSetSysCmdBuffer. Real sifcmd
++        // stores {handler, data} pairs in these arrays and some modules (e.g. Nautilus IOPUTY)
++        // read them back directly, so AddCmdHandler must write through to guest memory.
++        uint32_t m_userCmdTable = 0u;
++        uint32_t m_userCmdTableSize = 0u;
++        uint32_t m_sysCmdTable = 0u;
++        uint32_t m_sysCmdTableSize = 0u;
++        void writeGuestCmdEntry(uint32_t cid, uint32_t function, uint32_t data);
++        uint32_t m_cmdPacketBuffer = 0u;
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
+     };
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b498155..042be0e 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -207,6 +207,11 @@ namespace ps2x::iop
+         return hle->handleRpc(request);
+     }
+ 
++    bool IopSubsystem::sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize)
++    {
++        return m_impl->emulator.deliverEeSifCommand(commandId, packet, packetSize);
++    }
++
+     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
+     {
+         for (auto &service : m_impl->coreServices)
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..0ca4e58 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -197,6 +197,10 @@ struct EeThreadSnapshot
+     int suspendCount = 0;
+     uint32_t wakeupCount = 0;
+     uint32_t invocationDepth = 0;
++    int topInvocationKind = -1;
++    uint32_t baseContextPc = 0;
++    uint32_t pendingInvocations = 0;
++    uint32_t dbgRegs[4] = {0, 0, 0, 0}; // s0, s1, v0, v1 of the active context
+ };
+ 
+ struct EeSemaphoreSnapshot
+@@ -382,6 +386,7 @@ private:
+     void makeReady(GuestThread &thread, int result, bool interruptSafe);
+     void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
+     void applyPendingPreemption();
++    [[nodiscard]] bool runningInInterruptContext() const;
+     void processPendingEvents();
+     void processDueDeadlines();
+     void processEvent(const EeEvent &event);
+diff --git a/ps2xRuntime/include/runtime/ps2_overlay_banks.h b/ps2xRuntime/include/runtime/ps2_overlay_banks.h
+new file mode 100644
+index 0000000..82ebe9f
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_overlay_banks.h
+@@ -0,0 +1,54 @@
++#pragma once
++
++// Overlay function banks.
++//
++// Some games load different code overlays at the same guest address (Shadow Hearts: Covenant loads
++// FIELD.BIN, BATTLE.BIN and OPENING.BIN, all at 0x45EA80). Each overlay is recompiled separately
++// into its own C++ namespace and registers a "bank": a dense function table for its address range
++// plus a way to recognise, from guest memory, whether that overlay is the one currently loaded.
++//
++// When the main function table has no entry for an address, the runtime asks the banks. A bank
++// matches when the 32-bit words at `signatureAddr` and `signatureAddr + 4` in guest RAM equal
++// `signature0` / `signature1` (for Metrowerks overlays: the "MWo3" magic and the overlay id in the
++// header that is loaded together with the code). A bank with signatureAddr == 0 is always active
++// and only answers for addresses it has a function for (used for extra main-executable entries).
++
++#include <cstdint>
++#include "ps2_runtime.h"
++
++namespace ps2x_overlay
++{
++    struct Bank
++    {
++        const char *name = nullptr;
++        uint32_t signatureAddr = 0;
++        uint32_t signature0 = 0;
++        uint32_t signature1 = 0;
++        uint32_t tableBase = 0;  // guest address of slot 0
++        uint32_t slotCount = 0;  // one slot per 4 bytes
++        const PS2Runtime::RecompiledFunction *table = nullptr;
++    };
++
++    // Called from static initialisers in the generated overlay registration files.
++    void registerBank(const Bank &bank);
++
++    // Returns the recompiled function for `address` in the overlay currently loaded, or nullptr.
++    PS2Runtime::RecompiledFunction find(const uint8_t *rdram, uint32_t address);
++
++    // Name of the bank currently loaded at `address`, or nullptr (diagnostics).
++    const char *loadedBankName(const uint8_t *rdram, uint32_t address);
++
++    // A dense table filled at start-up from run-length records, so the generated registration
++    // file stays small: each run maps `count` consecutive slots starting at `firstSlot` to
++    // functions[functionIndex].
++    struct Run
++    {
++        uint32_t firstSlot;
++        uint32_t count;
++        uint32_t functionIndex;
++    };
++
++    void buildTable(PS2Runtime::RecompiledFunction *table, uint32_t slotCount,
++                    const PS2Runtime::RecompiledFunction *functions,
++                    const Run *runs, uint32_t runCount);
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..d823b96 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,4 @@
++#include "ps2x/iop/sif_diag.h"
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -254,7 +255,18 @@ void EeScheduler::run()
+             continue;
+         }
+ 
+-        if (!m_pendingInvocations.empty() && running->invocations.empty())
++        // Interrupt-type handlers are held back while the running code has interrupts disabled
++        // (`di` clears Status.EIE). Delivering them inside the guest's critical sections corrupts
++        // the data those sections protect; Shadow Hearts' Timer 0 handler edits the task timer list
++        // that the game's own code updates between di/ei, and the list ended up circular.
++        const bool guestInterruptsMasked = (context.cop0_status & 0x00010000u) == 0u;
++        const bool frontIsInterrupt = !m_pendingInvocations.empty() &&
++                                      (m_pendingInvocations.front().kind == GuestInvocationKind::Interrupt ||
++                                       m_pendingInvocations.front().kind == GuestInvocationKind::Alarm ||
++                                       m_pendingInvocations.front().kind == GuestInvocationKind::GsCallback ||
++                                       m_pendingInvocations.front().kind == GuestInvocationKind::SifCommand);
++        if (!m_pendingInvocations.empty() && running->invocations.empty() &&
++            !(frontIsInterrupt && guestInterruptsMasked))
+         {
+             GuestInvocation invocation = std::move(m_pendingInvocations.front());
+             m_pendingInvocations.pop_front();
+@@ -314,7 +326,7 @@ void EeScheduler::run()
+         }
+ 
+         processPendingEvents();
+-        if (m_rescheduleRequested && m_currentThreadId != 0)
++        if (m_rescheduleRequested && m_currentThreadId != 0 && !runningInInterruptContext())
+         {
+             GuestThread *preempted = currentThread();
+             assert(preempted != nullptr);
+@@ -377,13 +389,16 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     }
+ 
+     const GuestThread *running = currentThread();
+-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
++    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority) && !runningInInterruptContext())
+     {
+         m_rescheduleRequested = true;
+         m_timeSliceExpired = true;
+         return true;
+     }
+ 
++    // Inside an interrupt-context handler a thread switch must wait until the handler returns
++    // (see runningInInterruptContext). Yielding here anyway would bounce straight back into the
++    // handler without executing it: a livelock once a higher-priority thread is ready.
+     renewTimeSlice();
+     return false;
+ }
+@@ -445,6 +460,7 @@ int EeScheduler::createThread(const EeThreadCreateParams &params)
+     thread.initialPriority = params.priority;
+     thread.currentPriority = params.priority;
+     thread.status = EeThreadStatus::Dormant;
++    ps2x::iop::sifDiag("EE CreateThread id=%d entry=0x%x prio=%d", (int)id, (unsigned)params.entry, (int)params.priority);
+     m_threads.emplace(id, std::move(thread));
+     publishSnapshot();
+     return id;
+@@ -1516,6 +1532,16 @@ void EeScheduler::publishSnapshot()
+         snapshot.suspendCount = item.suspendCount;
+         snapshot.wakeupCount = item.wakeupCount;
+         snapshot.invocationDepth = static_cast<uint32_t>(item.invocations.size());
++        snapshot.topInvocationKind = item.invocations.empty() ? -1 : static_cast<int>(item.invocations.back().kind);
++        snapshot.baseContextPc = item.context.pc;
++        snapshot.pendingInvocations = static_cast<uint32_t>(m_pendingInvocations.size());
++        {
++            const R5900Context &ac = item.activeContext();
++            snapshot.dbgRegs[0] = getRegU32(&ac, 16);
++            snapshot.dbgRegs[1] = getRegU32(&ac, 17);
++            snapshot.dbgRegs[2] = getRegU32(&ac, 2);
++            snapshot.dbgRegs[3] = getRegU32(&ac, 3);
++        }
+         next.threads.push_back(snapshot);
+     }
+     std::sort(next.threads.begin(), next.threads.end(), [](const auto &left, const auto &right)
+@@ -1709,6 +1735,15 @@ void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
+ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe)
+ {
+     const GuestThread *running = currentThread();
++    {
++        static int diag = 0;
++        if (++diag <= 60)
++            ps2x::iop::sifDiag("EE ready thread id=%d prio=%d entry-pc=0x%x | running id=%d prio=%d | irqSafe=%d insideIrq=%d -> %s",
++                               (int)readyThread.id, (int)readyThread.currentPriority, (unsigned)readyThread.context.pc,
++                               running ? (int)running->id : -1, running ? (int)running->currentPriority : -1,
++                               (int)interruptSafe, (int)m_insideInterrupt,
++                               (!running || readyThread.currentPriority >= running->currentPriority) ? "no preempt" : "PREEMPT");
++    }
+     if (!running || readyThread.currentPriority >= running->currentPriority)
+     {
+         return;
+@@ -1720,12 +1755,47 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
+     }
+ }
+ 
++bool EeScheduler::runningInInterruptContext() const
++{
++    // A thread switch must never happen while an interrupt handler (or another handler that the
++    // real kernel runs in interrupt context) is only part-way through. A handler that wakes a
++    // higher-priority thread keeps running until it returns; the switch happens afterwards.
++    // Switching earlier lets the woken thread run in the middle of the handler: Shadow Hearts'
++    // Timer 0 handler calls iWakeupThread() and then unlinks the task's timer node, so the task
++    // thread re-armed the node, went back to sleep, and the handler then removed the new node,
++    // leaving that thread asleep for good.
++    const GuestThread *running = currentThread();
++    if (!running)
++    {
++        return false;
++    }
++    for (const GuestInvocation &invocation : running->invocations)
++    {
++        switch (invocation.kind)
++        {
++        case GuestInvocationKind::Interrupt:
++        case GuestInvocationKind::Alarm:
++        case GuestInvocationKind::GsCallback:
++        case GuestInvocationKind::SifCommand:
++            return true;
++        default:
++            break;
++        }
++    }
++    return false;
++}
++
+ void EeScheduler::applyPendingPreemption()
+ {
+     if (!m_rescheduleRequested)
+     {
+         return;
+     }
++    if (m_currentThreadId != 0 && runningInInterruptContext())
++    {
++        // Keep the request; it is applied once the handler has returned.
++        return;
++    }
+     if (m_currentThreadId == 0)
+     {
+         m_rescheduleRequested = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
+index b32e44a..e5e8a20 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "DMA.h"
++#include "MPEG.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -199,8 +200,32 @@ namespace ps2_stubs
+         TODO_NAMED("sceDmaRestart", rdram, ctx, runtime);
+     }
+ 
++    namespace
++    {
++        // DMA channel 4 (toIPU): hand the bitstream to the MPEG decoder instead of the
++        // (unemulated) IPU. Returns true if handled.
++        bool handleToIpuSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool normalMode)
++        {
++            const uint32_t chanArg = getRegU32(ctx, 4);
++            const uint32_t channelBase = resolveDmaChannelBase(rdram, chanArg);
++            if (channelBase != 0x1000B400u)
++            {
++                return false;
++            }
++            const uint32_t payload = getRegU32(ctx, 5);
++            const uint32_t count = getRegU32(ctx, 6);
++            mpegFeedFromIpuDma(rdram, runtime, payload, normalMode ? count : 0u, !normalMode);
++            setReturnS32(ctx, 0);
++            return true;
++        }
++    }
++
+     void sceDmaSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        if (handleToIpuSend(rdram, ctx, runtime, false))
++        {
++            return;
++        }
+         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
+     }
+ 
+@@ -216,6 +241,10 @@ namespace ps2_stubs
+ 
+     void sceDmaSendN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        if (handleToIpuSend(rdram, ctx, runtime, true))
++        {
++            return;
++        }
+         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, true));
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index aed4cb5..5d4635e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -1016,6 +1016,17 @@ namespace ps2_stubs
+         uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+ 
+         writeGsDispEnv(rdram, envAddr, display, dispfb);
++        // The SCE libgraph sceGsSetDefDispEnv also fills in PMODE and SMODE2 (verified against the
++        // copy linked into Shadow Hearts: Covenant, 0x200508): PMODE = 0x66 (read circuit 2
++        // enabled) and SMODE2 = 1 (interlace, field), 3 (interlace, frame) or 2 (progressive, FFMD).
++        // Leaving them zero made sceGsPutDispEnv switch both read circuits off.
++        if (uint8_t *envPtr = getMemPtr(rdram, envAddr))
++        {
++            const uint64_t pmode = 0x66ull;
++            const uint64_t smode2 = g_gparam.interlace ? (g_gparam.ffmode ? 3ull : 1ull) : 2ull;
++            std::memcpy(envPtr + 0x00, &pmode, sizeof(pmode));
++            std::memcpy(envPtr + 0x08, &smode2, sizeof(smode2));
++        }
+         setReturnS32(ctx, 0);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..f713c29 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1,3 +1,6 @@
++#include <cstring>
++#include <fstream>
++#include <vector>
+ #include <algorithm>
+ #include <cctype>
+ 
+@@ -322,6 +325,85 @@ namespace
+         }
+     }
+ 
++    // Look a path up in the configured disc image's ISO9660 directory tree and return its real
++    // extent. Using real LSNs keeps the EE side consistent with IOP modules (e.g. a game's own
++    // file driver) that read the same sectors through cdvdman from the image.
++    bool findInCdImage(const std::filesystem::path &image, const std::string &ps2Path, uint32_t &lsnOut, uint32_t &sizeOut)
++    {
++        std::ifstream iso(image, std::ios::binary);
++        if (!iso.is_open())
++            return false;
++        auto readSector = [&](uint32_t lsn, uint8_t *dst) -> bool
++        {
++            iso.clear();
++            iso.seekg(static_cast<std::streamoff>(lsn) * kCdSectorSize, std::ios::beg);
++            iso.read(reinterpret_cast<char *>(dst), kCdSectorSize);
++            return iso.gcount() == static_cast<std::streamsize>(kCdSectorSize);
++        };
++        auto le32 = [](const uint8_t *p) -> uint32_t
++        { return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24); };
++
++        uint8_t sector[kCdSectorSize];
++        if (!readSector(16u, sector) || sector[0] != 1u || std::memcmp(sector + 1, "CD001", 5) != 0)
++            return false;
++        uint32_t dirLsn = le32(sector + 156 + 2);
++        uint32_t dirSize = le32(sector + 156 + 10);
++
++        std::string rel = normalizeCdPathNoPrefix(ps2Path);
++        std::vector<std::string> parts;
++        for (size_t start = 0; start <= rel.size();)
++        {
++            size_t end = rel.find_first_of("/\\", start);
++            if (end == std::string::npos)
++                end = rel.size();
++            if (end > start)
++                parts.push_back(toLowerAscii(rel.substr(start, end - start)));
++            start = end + 1;
++        }
++        if (parts.empty())
++            return false;
++
++        for (size_t level = 0; level < parts.size(); ++level)
++        {
++            const bool last = level + 1 == parts.size();
++            bool found = false;
++            const uint32_t dirSectors = (dirSize + kCdSectorSize - 1u) / kCdSectorSize;
++            for (uint32_t s = 0; s < dirSectors && !found; ++s)
++            {
++                if (!readSector(dirLsn + s, sector))
++                    return false;
++                for (uint32_t off = 0; off < kCdSectorSize;)
++                {
++                    const uint8_t len = sector[off];
++                    if (len == 0u || off + len > kCdSectorSize || len < 34u)
++                        break;
++                    const uint8_t nameLen = sector[off + 32];
++                    std::string name(reinterpret_cast<const char *>(sector + off + 33), nameLen);
++                    const size_t semi = name.find(';');
++                    if (semi != std::string::npos)
++                        name.resize(semi);
++                    if (!name.empty() && name.back() == '.')
++                        name.pop_back();
++                    const bool isDir = (sector[off + 25] & 0x02u) != 0u;
++                    if (nameLen > 0 && !(nameLen == 1 && sector[off + 33] <= 1u) &&
++                        toLowerAscii(name) == parts[level] && isDir == !last)
++                    {
++                        dirLsn = le32(sector + off + 2);
++                        dirSize = le32(sector + off + 10);
++                        found = true;
++                        break;
++                    }
++                    off += len;
++                }
++            }
++            if (!found)
++                return false;
++        }
++        lsnOut = dirLsn;
++        sizeOut = dirSize;
++        return true;
++    }
++
+     bool registerCdFile(const std::string &ps2Path, CdFileEntry &entryOut)
+     {
+         const std::string key = cdPathKey(ps2Path);
+@@ -339,6 +421,23 @@ namespace
+             return true;
+         }
+ 
++        {
++            const std::filesystem::path image = getCdImagePath();
++            uint32_t imageLsn = 0, imageSize = 0;
++            if (!image.empty() && findInCdImage(image, ps2Path, imageLsn, imageSize))
++            {
++                CdFileEntry entry;
++                entry.hostPath = image; // marks an absolute-LSN entry, see readCdSectors
++                entry.sizeBytes = imageSize;
++                entry.baseLbn = imageLsn;
++                entry.sectors = sectorsForBytes(imageSize);
++                g_cdFilesByKey.emplace(key, entry);
++                entryOut = entry;
++                g_lastCdError = 0;
++                return true;
++            }
++        }
++
+         const std::filesystem::path root = getCdRootPath();
+         std::filesystem::path path = cdHostPath(ps2Path);
+         std::error_code ec;
+@@ -443,7 +542,9 @@ namespace
+             }
+ 
+             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
+-            const uint64_t offset = relativeLbn * kCdSectorSize;
++            // Entries found in the disc image use real LSNs: read the image at the absolute sector.
++            const bool fromImage = entry.hostPath == getCdImagePath();
++            const uint64_t offset = (fromImage ? static_cast<uint64_t>(lbn) : relativeLbn) * kCdSectorSize;
+             return readHostRange(entry.hostPath, offset, dst, byteCount);
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..5d0e209 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -541,6 +541,9 @@ namespace ps2_stubs
+             uint32_t pictureTraceCount = 0u;
+             uint32_t isEndTraceCount = 0u;
+             std::unordered_map<uint32_t, std::vector<MpegRegisteredCallback>> callbacksByMpeg;
++            uint32_t ipuActiveMpeg = 0u;       // mpeg whose sceMpegGetPicture last asked for data
++            uint64_t ipuBytesFed = 0u;
++            uint32_t ipuFeedTraceCount = 0u;
+             std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
+         };
+ 
+@@ -1873,6 +1876,109 @@ namespace ps2_stubs
+         setReturnS32(ctx, 0);
+     }
+ 
++    void mpegFeedFromIpuDma(uint8_t *rdram, PS2Runtime *runtime, uint32_t tagOrMadr, uint32_t qwc, bool chainMode)
++    {
++        if (!rdram || !runtime)
++        {
++            return;
++        }
++        // Collect the (address, bytes) pieces described by the transfer.
++        std::vector<std::pair<uint32_t, uint32_t>> pieces;
++        if (!chainMode)
++        {
++            pieces.emplace_back(tagOrMadr & PS2_RAM_MASK, qwc * 16u);
++        }
++        else
++        {
++            uint32_t tadr = tagOrMadr & PS2_RAM_MASK;
++            for (int guard = 0; guard < 4096; ++guard)
++            {
++                const uint8_t *tag = getConstMemPtr(rdram, tadr);
++                if (!tag)
++                {
++                    break;
++                }
++                uint32_t w0 = 0, w1 = 0;
++                std::memcpy(&w0, tag, 4);
++                std::memcpy(&w1, tag + 4, 4);
++                const uint32_t tqwc = w0 & 0xFFFFu;
++                const uint32_t id = (w0 >> 28) & 7u;
++                const uint32_t addr = w1 & 0x7FFFFFF0u;
++                bool end = false;
++                switch (id)
++                {
++                case 0: // refe
++                    pieces.emplace_back(addr, tqwc * 16u);
++                    end = true;
++                    break;
++                case 1: // cnt
++                    pieces.emplace_back(tadr + 16u, tqwc * 16u);
++                    tadr = tadr + 16u + tqwc * 16u;
++                    break;
++                case 2: // next
++                    pieces.emplace_back(tadr + 16u, tqwc * 16u);
++                    tadr = addr;
++                    break;
++                case 3: // ref
++                case 4: // refs
++                    pieces.emplace_back(addr, tqwc * 16u);
++                    tadr += 16u;
++                    break;
++                case 7: // end
++                    pieces.emplace_back(tadr + 16u, tqwc * 16u);
++                    end = true;
++                    break;
++                default: // call/ret: not expected for IPU input
++                    end = true;
++                    break;
++                }
++                if (end || ((w0 >> 31) & 1u)) // IRQ bit also terminates the chain here
++                {
++                    break;
++                }
++            }
++        }
++
++        uint32_t mpegAddr = 0u;
++        size_t total = 0u;
++        bool wake = false;
++        {
++            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            mpegAddr = g_mpeg_stub_state.ipuActiveMpeg;
++            if (mpegAddr == 0u)
++            {
++                return;
++            }
++            MpegPlaybackState &playback = getPlaybackState(mpegAddr);
++            const size_t framesBefore = playback.decodedFrames.size();
++            for (const auto &piece : pieces)
++            {
++                const uint32_t offset = piece.first & PS2_RAM_MASK;
++                const size_t len = std::min<size_t>(piece.second, PS2_RAM_SIZE - offset);
++                const uint8_t *src = getConstMemPtr(rdram, offset);
++                if (src && len)
++                {
++                    feedElementaryStream(playback, src, len);
++                    total += len;
++                }
++            }
++            playback.sawInput = playback.sawInput || total != 0u;
++            g_mpeg_stub_state.ipuBytesFed += total;
++            if (g_mpeg_stub_state.ipuFeedTraceCount < 16u)
++            {
++                ++g_mpeg_stub_state.ipuFeedTraceCount;
++                std::cerr << "[MPEG:ipu-dma] mpeg=0x" << std::hex << mpegAddr << std::dec << " fed=" << total
++                          << " total=" << g_mpeg_stub_state.ipuBytesFed << " frames=" << playback.decodedFrames.size()
++                          << " failed=" << playback.decoderFailed << std::endl;
++            }
++            wake = playback.decodedFrames.size() != framesBefore || playback.decoderFailed;
++        }
++        if (wake)
++        {
++            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
++        }
++    }
++
+     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+@@ -2307,6 +2413,68 @@ namespace ps2_stubs
+                     });
+                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
+                 }
++                // IPU-ring libmpeg model: libmpeg calls the game's sceMpegCbNodata (type 1)
++                // callback whenever the IPU input runs dry; the callback DMAs more bitstream to
++                // the IPU (channel 4), which mpegFeedFromIpuDma() hands to the decoder.
++                {
++                    uint32_t nodataFunc = 0u;
++                    uint32_t nodataData = 0u;
++                    auto cbIt = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
++                    if (cbIt != g_mpeg_stub_state.callbacksByMpeg.end())
++                    {
++                        for (const MpegRegisteredCallback &cb : cbIt->second)
++                        {
++                            if (!cb.stream && cb.type == 1u && cb.func != 0u)
++                            {
++                                nodataFunc = cb.func;
++                                nodataData = cb.data;
++                            }
++                        }
++                    }
++                    if (nodataFunc != 0u && runtime->hasFunction(nodataFunc))
++                    {
++                        g_mpeg_stub_state.ipuActiveMpeg = mpegAddr;
++                        lock.unlock();
++                        const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++                        if (cbDataAddr != 0u)
++                        {
++                            uint8_t *cbData = getMemPtr(rdram, cbDataAddr);
++                            if (cbData)
++                            {
++                                std::memset(cbData, 0, kMpegCallbackDataSize);
++                                *reinterpret_cast<uint32_t *>(cbData) = 1u; // sceMpegCbNodata
++                            }
++                        }
++                        GuestInvocation invocation{};
++                        invocation.kind = GuestInvocationKind::HleCall;
++                        invocation.context = *ctx;
++                        invocation.context.pc = nodataFunc;
++                        SET_GPR_U32(&invocation.context, 4, mpegAddr);
++                        SET_GPR_U32(&invocation.context, 5, cbDataAddr);
++                        SET_GPR_U32(&invocation.context, 6, nodataData);
++                        SET_GPR_U32(&invocation.context, 29, 0u);
++                        SET_GPR_U32(&invocation.context, 31, 0u);
++                        invocation.onComplete = [rdram, runtime, mpegAddr, cbDataAddr](const R5900Context &done, R5900Context &parent)
++                        {
++                            if (cbDataAddr != 0u)
++                            {
++                                runtime->guestFree(cbDataAddr);
++                            }
++                            const int32_t sent = static_cast<int32_t>(getRegU32(&done, 2));
++                            {
++                                std::lock_guard<std::mutex> relock(g_mpeg_stub_mutex);
++                                MpegPlaybackState &pb = getPlaybackState(mpegAddr);
++                                if (sent <= 0 && pb.decodedFrames.empty())
++                                {
++                                    // The game had no more data to give: the stream is over.
++                                    pb.streamEnded = true;
++                                }
++                            }
++                            sceMpegGetPicture(rdram, &parent, runtime);
++                        };
++                        runtime->eeScheduler().invokeCurrent(std::move(invocation));
++                    }
++                }
+                 lock.unlock();
+                 runtime->eeScheduler().waitExternal(
+                     EeWaitReason::Mpeg,
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
+index bbf7edf..8f3f5a5 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
+@@ -5,6 +5,10 @@
+ namespace ps2_stubs
+ {
+     void resetMpegStubState();
++    // Bitstream sent to the IPU with sceDmaSend on DMA channel 4 (toIPU). Games built on the
++    // IPU-ring model of libmpeg (e.g. Shadow Hearts: Covenant) feed movies this way from their
++    // sceMpegCbNodata callback instead of using sceMpegDemuxPss/sceMpegAddBs.
++    void mpegFeedFromIpuDma(uint8_t *rdram, PS2Runtime *runtime, uint32_t tagOrMadr, uint32_t qwc, bool chainMode);
+     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
+     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
+     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975ed..fac9435 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "SIF.h"
++#include "ps2x/iop/sif_diag.h"
+ #include "../Syscalls/RPC.h"
+ #include "../../ps2_iop_transport.h"
+ #include "runtime/ps2_address.h"
+@@ -24,31 +25,7 @@ namespace ps2_stubs
+ 
+     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        const uint32_t srcAddr = getRegU32(ctx, 7); // $a3
+-        const uint32_t dstAddr = readStackU32(rdram, ctx, 16);
+-        const uint32_t size = readStackU32(rdram, ctx, 20);
+-        if (size != 0u && srcAddr != 0u && dstAddr != 0u)
+-        {
+-            std::vector<uint8_t> payload(size);
+-            bool valid = runtime != nullptr;
+-            for (uint32_t i = 0; i < size; ++i)
+-            {
+-                const uint8_t *src = getConstMemPtr(rdram, srcAddr + i);
+-                if (!src)
+-                {
+-                    valid = false;
+-                    break;
+-                }
+-                payload[i] = *src;
+-            }
+-            if (!valid || !runtime->writeIopMemory(dstAddr, payload.data(), payload.size()))
+-            {
+-                setReturnS32(ctx, 0);
+-                return;
+-            }
+-        }
+-
+-        setReturnS32(ctx, 1);
++        ps2_syscalls::sceSifSendCmd(rdram, ctx, runtime);
+     }
+ 
+     namespace
+@@ -71,6 +48,7 @@ namespace ps2_stubs
+         {
+             uint32_t function = 0u;
+             uint32_t argument = 0u;
++            uint32_t gp = 0;  // caller's $gp at registration; handlers run with it
+         };
+ 
+         std::unordered_map<uint32_t, SifCmdHandler> g_sifCmdHandlers;
+@@ -240,12 +218,19 @@ namespace ps2_stubs
+             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+             const auto handler = g_sifCmdHandlers.find(commandId);
+             if (handler == g_sifCmdHandlers.end() || handler->second.function == 0u)
++            {
++                ps2x::iop::sifDiag("EE dispatch cid=0x%x: no EE handler registered (%zu registered)", commandId, g_sifCmdHandlers.size());
+                 return false;
++            }
+             registered = handler->second;
+         }
+ 
+         if (!runtime->hasFunction(registered.function))
++        {
++            ps2x::iop::sifDiag("EE dispatch cid=0x%x: handler 0x%x has no recompiled function", commandId, registered.function);
+             return false;
++        }
++        ps2x::iop::sifDiag("EE dispatch cid=0x%x -> queue EE handler 0x%x", commandId, registered.function);
+ 
+         const uint32_t packetAddress = runtime->guestMalloc(static_cast<uint32_t>(packetSize), 16u);
+         if (packetAddress == 0u)
+@@ -271,12 +256,18 @@ namespace ps2_stubs
+             invocation.context.pc = registered.function;
+             SET_GPR_U32(&invocation.context, 4, packetAddress);
+             SET_GPR_U32(&invocation.context, 5, registered.argument);
++            // Real EE SIF command handlers run from the game's DMAC interrupt handler with the
++            // game's $gp; the runtime CPU snapshot may not hold it (it can be 0).
++            if (registered.gp != 0u)
++                SET_GPR_U32(&invocation.context, 28, registered.gp);
+             SET_GPR_U32(&invocation.context, 6, 0u);
+             SET_GPR_U32(&invocation.context, 7, 0u);
+             SET_GPR_U32(&invocation.context, 29, 0u);
+             SET_GPR_U32(&invocation.context, 31, 0u);
+-            invocation.onComplete = [runtime, packetAddress](const R5900Context &, R5900Context &)
++            ps2x::iop::sifDiag("EE dispatch cid=0x%x invocation gp=0x%x", commandId, getRegU32(&invocation.context, 28));
++            invocation.onComplete = [runtime, packetAddress, commandId](const R5900Context &done, R5900Context &)
+             {
++                ps2x::iop::sifDiag("EE SIF handler for cid=0x%x completed (pc=0x%x)", commandId, done.pc);
+                 runtime->guestFree(packetAddress);
+             };
+             runtime->eeScheduler().queueInvocation(std::move(invocation));
+@@ -295,7 +286,12 @@ namespace ps2_stubs
+         const uint32_t handler = getRegU32(ctx, 5);
+         const uint32_t argument = getRegU32(ctx, 6);
+         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+-        g_sifCmdHandlers[cid] = SifCmdHandler{handler, argument};
++        SifCmdHandler entry{};
++        entry.function = handler;
++        entry.argument = argument;
++        entry.gp = getRegU32(ctx, 28);
++        g_sifCmdHandlers[cid] = entry;
++        ps2x::iop::sifDiag("EE sceSifAddCmdHandler cid=0x%x handler=0x%x arg=0x%x gp=0x%x", cid, handler, argument, getRegU32(ctx, 28));
+         setReturnS32(ctx, 0);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..684333e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -1,4 +1,6 @@
+ #include "Common.h"
++#include <cstring>
++#include <vector>
+ #include "RPC.h"
+ #include "../../ps2_iop_transport.h"
+ 
+@@ -970,34 +972,72 @@ namespace ps2_syscalls
+ 
+     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        uint32_t cid = getRegU32(ctx, 4);
+-        uint32_t packetAddr = getRegU32(ctx, 5);
+-        uint32_t packetSize = getRegU32(ctx, 6);
+-        uint32_t srcExtra = getRegU32(ctx, 7);
++        // EE->IOP SIF command: sceSifSendCmd(cid, packet, psize, src_extra, dest_extra, size_extra)
++        constexpr uint32_t kHeaderSize = 16u;
++        constexpr uint32_t kMaxPacketSize = 112u;
++        const uint32_t cid = getRegU32(ctx, 4);
++        const uint32_t packetAddr = getRegU32(ctx, 5);
++        const uint32_t packetSize = getRegU32(ctx, 6);
++        const uint32_t srcExtra = getRegU32(ctx, 7);
++
++        // EE code uses the EABI: arguments 5-8 are passed in $t0-$t3, not on the stack
++        // (unlike IOP/O32 code). dest_extra is an IOP address, size_extra a byte count.
++        const uint32_t destExtra = getRegU32(ctx, 8);
++        const uint32_t sizeExtra = getRegU32(ctx, 9);
++
++        if (packetAddr == 0u || packetSize < kHeaderSize || packetSize > kMaxPacketSize)
++        {
++            setReturnS32(ctx, 0);
++            return;
++        }
+ 
+-        uint32_t sp = getRegU32(ctx, 29);
+-        uint32_t destExtra = 0;
+-        uint32_t sizeExtra = 0;
+-        readStackU32(rdram, sp, 0x10, destExtra);
+-        readStackU32(rdram, sp, 0x14, sizeExtra);
++        // Optional extra data goes from EE memory into IOP memory (dest_extra is an IOP address).
++        if (sizeExtra > 0u && srcExtra != 0u && destExtra != 0u && runtime)
++        {
++            std::vector<uint8_t> extra(sizeExtra);
++            for (uint32_t i = 0; i < sizeExtra; ++i)
++            {
++                const uint8_t *src = getConstMemPtr(rdram, srcExtra + i);
++                extra[i] = src ? *src : 0u;
++            }
++            (void)runtime->writeIopMemory(destExtra, extra.data(), extra.size());
++        }
+ 
+-        if (sizeExtra > 0 && srcExtra && destExtra)
++        uint8_t packet[kMaxPacketSize] = {};
++        for (uint32_t i = 0; i < packetSize; ++i)
+         {
+-            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
++            const uint8_t *src = getConstMemPtr(rdram, packetAddr + i);
++            packet[i] = src ? *src : 0u;
+         }
++        // Fill the SIF command header the way the EE sifcmd library does.
++        const uint32_t sizeWord = (packetSize & 0xFFu) | (sizeExtra << 8u);
++        std::memcpy(packet + 0u, &sizeWord, sizeof(sizeWord));
++        std::memcpy(packet + 4u, &destExtra, sizeof(destExtra));
++        std::memcpy(packet + 8u, &cid, sizeof(cid));
++        if (getConstMemPtr(rdram, packetAddr) != nullptr)
++        {
++            for (uint32_t i = 0; i < 12u; ++i)
++                *getMemPtr(rdram, packetAddr + i) = packet[i];
++        }
++
++        const bool delivered = PS2IopTransport::sendSifCommand(runtime, rdram, ctx, cid, packet, packetSize);
+ 
+         static int logCount = 0;
+-        if (logCount < 5)
++        if (logCount < 16)
+         {
+             RUNTIME_LOG("[sceSifSendCmd] cid=0x" << std::hex << cid
+                                                  << " packet=0x" << packetAddr
+                                                  << " psize=0x" << packetSize
+-                                                 << " extra=0x" << destExtra << std::dec << std::endl);
++                                                 << " extra=0x" << destExtra
++                                                 << " esize=0x" << sizeExtra << std::dec
++                                                 << (delivered ? " -> IOP handler" : " -> no IOP handler") << std::endl);
+             ++logCount;
+         }
+ 
+-        // Return non-zero on success.
+-        setReturnS32(ctx, 1);
++        // Real sceSifSendCmd returns a non-zero DMA id.
++        static uint32_t nextId = 1u;
++        setReturnS32(ctx, static_cast<int32_t>(nextId));
++        nextId = (nextId >= 0x7FFFFFFFu) ? 1u : nextId + 1u;
+     }
+ 
+     void sceRpcGetPacket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..7854eff 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -1,6 +1,7 @@
+ #include "Common.h"
+ #include "Thread.h"
+ #include "runtime/ee_scheduler.h"
++#include "ps2x/iop/sif_diag.h"
+ 
+ namespace ps2_syscalls
+ {
+@@ -134,6 +135,12 @@ namespace ps2_syscalls
+         {
+             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+             const int result = ee.wakeupThread(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
++            {
++                static int diag = 0;
++                if (++diag <= 400)
++                    ps2x::iop::sifDiag("EE %sWakeupThread(%d) from cur=%d ra=0x%x -> %d", interruptSafe ? "i" : "",
++                                       (int)getRegU32(ctx, 4), ee.currentThreadId(), (unsigned)getRegU32(ctx, 31), result);
++            }
+             setReturnS32(ctx, result);
+             ee.transferIfRequested(interruptSafe);
+         }
+@@ -329,6 +336,11 @@ namespace ps2_syscalls
+     void GetThreadId(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         setReturnS32(ctx, scheduler(rdram, ctx, runtime).currentThreadId());
++        {
++            static int diag = 0;
++            if (++diag <= 200)
++                ps2x::iop::sifDiag("EE GetThreadId -> %d ra=0x%x", (int)getRegU32(ctx, 2), (unsigned)getRegU32(ctx, 31));
++        }
+     }
+ 
+     void ReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -375,6 +387,11 @@ namespace ps2_syscalls
+     void SleepThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         EeScheduler &ee = scheduler(rdram, ctx, runtime);
++        {
++            static int diag = 0;
++            if (++diag <= 400)
++                ps2x::iop::sifDiag("EE SleepThread cur=%d ra=0x%x", ee.currentThreadId(), (unsigned)getRegU32(ctx, 31));
++        }
+         ee.sleepCurrent();
+         setReturnS32(ctx, KE_OK);
+     }
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+index 1e38bd4..392d799 100644
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -181,3 +181,6 @@ namespace ps2_game_overrides
+         }
+     }
+ }
++
++// Per-game override modules
++#include "game_overrides/shadow_hearts_covenant_usa.inl"
+diff --git a/ps2xRuntime/src/lib/game_overrides/shadow_hearts_covenant_usa.inl b/ps2xRuntime/src/lib/game_overrides/shadow_hearts_covenant_usa.inl
+new file mode 100644
+index 0000000..a4d2ceb
+--- /dev/null
++++ b/ps2xRuntime/src/lib/game_overrides/shadow_hearts_covenant_usa.inl
+@@ -0,0 +1,22 @@
++// Shadow Hearts: Covenant (USA, SLUS_210.41) runtime overrides.
++//
++// Included from game_overrides.cpp so the registration object is linked (a separate translation
++// unit in the static runtime library would be dropped by the linker as unreferenced).
++
++namespace shc_usa
++{
++    // sceCdLayerSearchFile(sceCdlFILE *fp, const char *name, int layer) at 0x215860 has no runtime
++    // handler, so the game's own libcdvd code runs, binds the cdvdfsv RPC server 0x80000597 and
++    // retries forever because the runtime has no cdvdfsv RPC service. The game uses it to locate
++    // its .PKB packages. The first two arguments match sceCdSearchFile(fp, name); this is a single
++    // layer disc, so the layer argument can be ignored.
++    constexpr uint32_t kSceCdLayerSearchFile = 0x00215860u;
++
++    void apply(PS2Runtime &runtime)
++    {
++        if (!ps2_game_overrides::bindAddressHandler(runtime, kSceCdLayerSearchFile, "sceCdSearchFile"))
++            std::cerr << "[shc] failed to bind sceCdLayerSearchFile override" << std::endl;
++    }
++}
++
++PS2_REGISTER_GAME_OVERRIDE("Shadow Hearts: Covenant (USA)", "SLUS_210.41", 0x00200008u, 0u, &shc_usa::apply)
+diff --git a/ps2xRuntime/src/lib/ps2_iop_transport.h b/ps2xRuntime/src/lib/ps2_iop_transport.h
+index 6bd1835..a149992 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_transport.h
++++ b/ps2xRuntime/src/lib/ps2_iop_transport.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "ps2_runtime.h"
++#include "ps2_iop_host.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ 
+ #include <utility>
+@@ -28,6 +29,22 @@ public:
+                    : ps2x::iop::RpcResult{};
+     }
+ 
++    // EE->IOP SIF command (sceSifSendCmd). Delivers the packet to the handler an IOP module
++    // registered with sifcmd sceSifAddCmdHandler. False if no handler is registered.
++    [[nodiscard]] static bool sendSifCommand(
++        PS2Runtime *runtime,
++        uint8_t *rdram,
++        R5900Context *context,
++        uint32_t commandId,
++        const void *packet,
++        size_t packetSize)
++    {
++        if (!runtime || !runtime->m_iopHost || !runtime->m_iopSubsystem)
++            return false;
++        auto scope = runtime->m_iopHost->enterCall(context, rdram);
++        return runtime->m_iopSubsystem->sendSifCommand(commandId, packet, packetSize);
++    }
++
+     [[nodiscard]] static bool canBindRpc(const PS2Runtime *runtime, uint32_t sid)
+     {
+         return !runtime || runtime->canBindIopRpc(sid);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..3151245 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -402,6 +402,10 @@ bool PS2Memory::initialize(size_t ramSize)
+ void PS2Memory::resetEeTimers() noexcept
+ {
+     m_eeTimers = {};
++    // The EE kernel keeps Timer 3 running as a free-running H-BLANK counter (its alarm time
++    // base). Games read T3_COUNT directly as a clock without configuring it, so start it the
++    // way the BIOS leaves it: count enabled (CUE), clock = H-BLANK (CLKS=3), no interrupts.
++    m_eeTimers[3].mode = (1u << 7) | 3u;
+ }
+ 
+ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..79318fd 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -20,6 +21,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
++#include "runtime/ps2_overlay_banks.h"
+ #include <limits>
+ #include <chrono>
+ #include <atomic>
+@@ -1065,6 +1067,14 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+         paths.mcRoot = paths.elfDirectory / "mc0";
+     }
+ 
++    // Optional disc image for raw sector reads (sceCdRead by LBN). Games that walk the
++    // ISO9660 filesystem themselves need this; the extracted folder alone is not enough.
++    if (const char *image = std::getenv("PS2X_CD_IMAGE"); image && *image)
++    {
++        paths.cdImage = normalizeAbsolutePath(std::filesystem::path(image));
++        std::cout << "[io] CD image: " << paths.cdImage.string() << std::endl;
++    }
++
+     setIoPaths(paths);
+ }
+ 
+@@ -1109,10 +1119,94 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
+     return replaceFunction(address, func);
+ }
+ 
++namespace ps2x_overlay
++{
++    namespace
++    {
++        std::vector<Bank> &banks()
++        {
++            static std::vector<Bank> list;
++            return list;
++        }
++
++        const Bank *loadedBank(const uint8_t *rdram, uint32_t address)
++        {
++            if (!rdram || (address & 3u) != 0u)
++            {
++                return nullptr;
++            }
++            for (const Bank &bank : banks())
++            {
++                if (address < bank.tableBase || ((address - bank.tableBase) >> 2) >= bank.slotCount)
++                {
++                    continue;
++                }
++                if (bank.signatureAddr == 0u)
++                {
++                    // Always-active supplement bank (e.g. extra entry points into the main executable).
++                    if (bank.table[(address - bank.tableBase) >> 2] != nullptr)
++                    {
++                        return &bank;
++                    }
++                    continue;
++                }
++                const uint32_t sig = bank.signatureAddr & 0x1FFFFFFu;
++                if (sig + 8u > PS2_RAM_SIZE)
++                {
++                    continue;
++                }
++                uint32_t w0 = 0, w1 = 0;
++                std::memcpy(&w0, rdram + sig, 4);
++                std::memcpy(&w1, rdram + sig + 4, 4);
++                if (w0 == bank.signature0 && w1 == bank.signature1)
++                {
++                    return &bank;
++                }
++            }
++            return nullptr;
++        }
++    }
++
++    void registerBank(const Bank &bank)
++    {
++        banks().push_back(bank);
++    }
++
++    PS2Runtime::RecompiledFunction find(const uint8_t *rdram, uint32_t address)
++    {
++        const Bank *bank = loadedBank(rdram, address);
++        return bank ? bank->table[(address - bank->tableBase) >> 2] : nullptr;
++    }
++
++    const char *loadedBankName(const uint8_t *rdram, uint32_t address)
++    {
++        const Bank *bank = loadedBank(rdram, address);
++        return bank ? bank->name : nullptr;
++    }
++
++    void buildTable(PS2Runtime::RecompiledFunction *table, uint32_t slotCount,
++                    const PS2Runtime::RecompiledFunction *functions,
++                    const Run *runs, uint32_t runCount)
++    {
++        for (uint32_t i = 0; i < runCount; ++i)
++        {
++            const Run &run = runs[i];
++            for (uint32_t k = 0; k < run.count && run.firstSlot + k < slotCount; ++k)
++            {
++                table[run.firstSlot + k] = functions[run.functionIndex];
++            }
++        }
++    }
++}
++
+ bool PS2Runtime::hasFunction(uint32_t address) const
+ {
+     uint32_t slot = 0u;
+-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
++    if (generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr)
++    {
++        return true;
++    }
++    return ps2x_overlay::find(const_cast<PS2Memory &>(m_memory).getRDRAM(), address) != nullptr;
+ }
+ 
+ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1147,6 +1241,10 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+             return fn;
+         }
+     }
++    if (RecompiledFunction fn = ps2x_overlay::find(m_memory.getRDRAM(), address))
++    {
++        return fn;
++    }
+ 
+     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
+@@ -2410,6 +2508,8 @@ void PS2Runtime::run()
+                                                << " gp=0x" << dbgGp
+                                                << " dispfb1=0x" << gs.dispfb1
+                                                << " display1=0x" << gs.display1
++                                               << " pmode=0x" << gs.pmode << " smode2=0x" << gs.smode2
++                                               << " dispfb2=0x" << gs.dispfb2 << " display2=0x" << gs.display2
+                                                << std::dec
+                                                << " activeThreads=" << eeSnapshot.threads.size()
+                                                << " dma=" << curDma
+@@ -2417,6 +2517,37 @@ void PS2Runtime::run()
+                                                << " gsw=" << curGs
+                                                << " vif=" << curVif
+                                                << std::endl);
++                if (std::getenv("PS2X_SIFDIAG"))
++                {
++                    for (const auto &t : eeSnapshot.threads)
++                    {
++                        RUNTIME_LOG("[run:thr] id=" << t.id << " st=" << static_cast<int>(t.status)
++                                                    << " wait=" << static_cast<int>(t.waitReason) << "/" << t.waitId
++                                                    << " prio=" << t.currentPriority << std::hex
++                                                    << " pc=0x" << t.pc << " ra=0x" << t.ra << " entry=0x" << t.entry
++                                                    << std::dec << " wakeups=" << t.wakeupCount
++                                                    << " depth=" << t.invocationDepth << " topKind=" << t.topInvocationKind
++                                                    << std::hex << " basePc=0x" << t.baseContextPc << std::dec
++                                                    << " pendingInv=" << t.pendingInvocations << std::hex << " s0=0x" << t.dbgRegs[0]
++                                                    << " s1=0x" << t.dbgRegs[1] << " v0=0x" << t.dbgRegs[2] << " v1=0x" << t.dbgRegs[3]
++                                                    << std::dec << std::endl);
++                    }
++                    for (const auto &s : eeSnapshot.semaphores)
++                    {
++                        RUNTIME_LOG("[run:sema] id=" << s.id << " count=" << s.count << " max=" << s.maxCount
++                                                     << " waiters=" << s.waiters << std::endl);
++                    }
++                    const uint8_t *rd = m_memory.getRDRAM();
++                    if (const char *dumpPath = std::getenv("PS2X_DUMPRAM"); dumpPath && tick == static_cast<uint64_t>(std::atoi(std::getenv("PS2X_DUMPTICK") ? std::getenv("PS2X_DUMPTICK") : "1200")))
++                    {
++                        if (FILE *df = std::fopen(dumpPath, "wb"))
++                        {
++                            std::fwrite(rd, 1, 32u * 1024u * 1024u, df);
++                            std::fclose(df);
++                            RUNTIME_LOG("[run:dump] wrote " << dumpPath << std::endl);
++                        }
++                    }
++                }
+ 
+             }
+         });
