@@ -21,8 +21,6 @@ by **static recompilation** of the game's MIPS (R5900) code to C++, using
 | **First picture: disclaimer + title logo** | **done (2026-11-23)** |
 | Controller input, audio output, in-game rendering (VU1), speed | not started |
 
-![First light](screenshots/2026-11-23-first-light.png)
-
 *Local test, debug panel open (F1 hides it).*
 
 ## Repository layout
