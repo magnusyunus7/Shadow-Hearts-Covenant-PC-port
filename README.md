@@ -10,16 +10,11 @@ by **static recompilation** of the game's MIPS (R5900) code to C++, using
 
 ## Status
 
-| Milestone | State |
-|---|---|
-| Executable re-sectioned and recompiled (4,838 functions, 0 errors) | done |
-| Static constructors, IOP modules (8 IRX), SIF command channel | done |
-| Disc file access (ISO9660 LSNs, FIO.IRX streaming, PKB archives) | done |
-| Sound driver init (SDRV_IOP), sound bank upload | done |
-| Overlays (OPENING / FIELD / BATTLE) switched at run time | done |
-| Opening movie decoded (IPU-ring libmpeg → FFmpeg) | decoding works, on-screen display not yet verified |
-| **First picture: disclaimer + title logo** | **done (2026-11-23)** |
-| Controller input, audio output, in-game rendering (VU1), speed | not started |
+![Progress](docs/progress.svg)
+
+The chart is drawn from `docs/status.json` by `scripts/progress.py`. Details of every fix are in
+[`docs/progress.md`](docs/progress.md), and the technical background is in
+[`docs/findings.md`](docs/findings.md).
 
 ## Repository layout
 
@@ -44,8 +39,8 @@ Full step-by-step notes are in `docs/build.md`. In short:
 5. Run `ps2_analyzer` and `ps2_recomp` with the configs in `config/`.
 6. `scripts/ovlbank.py` turns each overlay output (and the extra main entries, name `ZMAIN`,
    argument `-`) into `zz_ovl_*` files in `ps2xRuntime/src/runner/`.
-7. Build `ps2EntryRunner` (MSVC Debug, unity batch 8 recommended on 8 GB RAM).
-8. Run with `PS2X_CD_IMAGE=<your iso>`; set `PS2X_SIFDIAG=1` for diagnostics.
+7. Build `ps2EntryRunner` (MSVC **Release**, unity batch 8, `/m:1` on 8 GB RAM; see `docs/build.md`).
+8. Run with `PS2X_CD_IMAGE=<your iso>`. Optional diagnostics are listed in `docs/build.md`.
 
 ## License
 
