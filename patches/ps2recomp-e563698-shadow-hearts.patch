@@ -12,7 +12,7 @@ index 68fec81..7766f2a 100644
  
          // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
 diff --git a/ps2xIOP/include/ps2x/iop/sif_diag.h b/ps2xIOP/include/ps2x/iop/sif_diag.h
-new file mode 100644
+new file mode 100755
 index 0000000..a3806a1
 --- /dev/null
 +++ b/ps2xIOP/include/ps2x/iop/sif_diag.h
@@ -527,6 +527,90 @@ index b498155..042be0e 100644
      void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
      {
          for (auto &service : m_impl->coreServices)
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..42f8470 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -469,6 +469,26 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+     )
+ endif()
+ 
++# Keep oversized generated functions out of unity batches: bundling several
++# multi-MB functions into one translation unit exhausts cl.exe's heap (C1002).
++set(PS2X_RUNNER_UNITY_SKIP_BYTES "1000000" CACHE STRING "Runner sources larger than this many bytes are compiled on their own")
++if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
++    foreach(PS2X_RUNNER_SRC IN LISTS RUNNER_SRC_FILES)
++        file(SIZE "${PS2X_RUNNER_SRC}" PS2X_RUNNER_SRC_SIZE)
++        if(PS2X_RUNNER_SRC_SIZE GREATER PS2X_RUNNER_UNITY_SKIP_BYTES)
++            set_source_files_properties("${PS2X_RUNNER_SRC}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
++            # These files already carry "#pragma optimize("", off)" (scripts/deopt_huge.py), but
++            # cl.exe still ran out of heap in pass 2 on the 6 MB ones in Release. Compile them
++            # exactly like Debug does (/Od /Ob0), which is known to succeed.
++            if(MSVC)
++                set_property(SOURCE "${PS2X_RUNNER_SRC}" APPEND PROPERTY COMPILE_OPTIONS "$<$<NOT:$<CONFIG:Debug>>:/Od;/Ob0>")
++                # The PCH is built with /O2; a source using it ignores /Od (warning C4653).
++                set_source_files_properties("${PS2X_RUNNER_SRC}" PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
++            endif()
++        endif()
++    endforeach()
++endif()
++
+ if(PS2X_ENABLE_RUNNER_PCH)
+     set(PS2X_RUNNER_PCH_HEADERS
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
+@@ -499,6 +519,8 @@ endif()
+ 
+ if(MSVC)
+     target_compile_options(ps2EntryRunner PRIVATE /FS)
++    # Linker map so host profiler offsets (PS2X_PROFILE) can be resolved to functions.
++    target_link_options(ps2EntryRunner PRIVATE /MAP)
+ endif()
+ 
+ target_include_directories(ps2_runtime PUBLIC
+diff --git a/ps2xRuntime/include/ps2_log.h b/ps2xRuntime/include/ps2_log.h
+index a42b1ba..d0a94de 100644
+--- a/ps2xRuntime/include/ps2_log.h
++++ b/ps2xRuntime/include/ps2_log.h
+@@ -2,6 +2,7 @@
+ #define PS2_LOG_H
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <deque>
+ #include <filesystem>
+ #include <fstream>
+@@ -160,8 +161,22 @@ inline int &depth()
+     static thread_local int d = 0;
+     return d;
+ }
++// Per-function enter/exit tracing writes and flushes two lines for every
++// recompiled function call. That costs ~97% of game-thread time on Windows,
++// so it is opt-in at runtime: set PS2X_FNTRACE=1 to enable it.
++inline bool fn_trace_enabled()
++{
++    static const bool enabled = []()
++    {
++        const char *v = std::getenv("PS2X_FNTRACE");
++        return v != nullptr && v[0] == '1';
++    }();
++    return enabled;
++}
+ inline void log_entry(const char *name)
+ {
++    if (!fn_trace_enabled())
++        return;
+     for (int i = 0; i < depth(); ++i)
+         log_stream() << '\t';
+     log_stream() << ">> " << name << " enter\n";
+@@ -170,6 +185,8 @@ inline void log_entry(const char *name)
+ }
+ inline void log_exit(const char *name)
+ {
++    if (!fn_trace_enabled())
++        return;
+     depth()--;
+     for (int i = 0; i < depth(); ++i)
+         log_stream() << '\t';
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
 index f247ff9..0ca4e58 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
@@ -551,7 +635,7 @@ index f247ff9..0ca4e58 100644
      void processDueDeadlines();
      void processEvent(const EeEvent &event);
 diff --git a/ps2xRuntime/include/runtime/ps2_overlay_banks.h b/ps2xRuntime/include/runtime/ps2_overlay_banks.h
-new file mode 100644
+new file mode 100755
 index 0000000..82ebe9f
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/ps2_overlay_banks.h
@@ -611,7 +695,7 @@ index 0000000..82ebe9f
 +                    const Run *runs, uint32_t runCount);
 +}
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..d823b96 100644
+index c5e31c4..9f08564 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -1,3 +1,4 @@
@@ -674,7 +758,18 @@ index c5e31c4..d823b96 100644
      m_threads.emplace(id, std::move(thread));
      publishSnapshot();
      return id;
-@@ -1516,6 +1532,16 @@ void EeScheduler::publishSnapshot()
+@@ -490,6 +506,10 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+     }
+ 
+     target->context = R5900Context{};
++    // VU0 vf0 is hardwired to (0, 0, 0, 1) on the EE. R5900Context{} zeroes it, and game
++    // code builds identity matrices from vf0 (VMR32 rotations), so a zero vf0 makes every
++    // matrix built on this thread all-zero (black 3D scenes).
++    target->context.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+     target->context.pc = target->entry;
+     target->arg = arg;
+     target->suspendCount = 0;
+@@ -1516,6 +1536,16 @@ void EeScheduler::publishSnapshot()
          snapshot.suspendCount = item.suspendCount;
          snapshot.wakeupCount = item.wakeupCount;
          snapshot.invocationDepth = static_cast<uint32_t>(item.invocations.size());
@@ -691,7 +786,7 @@ index c5e31c4..d823b96 100644
          next.threads.push_back(snapshot);
      }
      std::sort(next.threads.begin(), next.threads.end(), [](const auto &left, const auto &right)
-@@ -1709,6 +1735,15 @@ void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
+@@ -1709,6 +1739,15 @@ void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
  void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe)
  {
      const GuestThread *running = currentThread();
@@ -707,7 +802,7 @@ index c5e31c4..d823b96 100644
      if (!running || readyThread.currentPriority >= running->currentPriority)
      {
          return;
-@@ -1720,12 +1755,47 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
+@@ -1720,12 +1759,47 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
      }
  }
  
@@ -755,6 +850,445 @@ index c5e31c4..d823b96 100644
      if (m_currentThreadId == 0)
      {
          m_rescheduleRequested = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/HostProfiler.cpp b/ps2xRuntime/src/lib/Kernel/HostProfiler.cpp
+new file mode 100755
+index 0000000..d81b7da
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/HostProfiler.cpp
+@@ -0,0 +1,433 @@
++// Host-side sampling profiler (Windows only, opt-in).
++//
++// Set PS2X_PROFILE=<output file> before starting the runner. A background thread
++// then samples the instruction pointer of the game thread (and the main/render
++// thread) about every millisecond, walks its stack, and appends a histogram to <output file> every
++// 10 seconds. Offsets are relative to the runner executable's load address, so
++// they can be resolved with the linker map file (ps2EntryRunner.map).
++//
++// Diagnostic only: has no effect unless PS2X_PROFILE is set.
++
++#include <cstdint>
++#include <cstdlib>
++
++#if defined(_WIN32)
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++namespace ps2x_prof
++{
++    namespace
++    {
++        struct Sampled
++        {
++            HANDLE handle = nullptr;
++            const char *name = "";
++            std::unordered_map<std::string, uint32_t> hist;
++            uint64_t total = 0;
++            uint64_t failed = 0;
++        };
++
++        void describeAddress(uint64_t addr, uintptr_t exeBase, char *out, size_t outSize)
++        {
++            HMODULE mod = nullptr;
++            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                   reinterpret_cast<LPCSTR>(addr), &mod) &&
++                mod != nullptr)
++            {
++                const uintptr_t modBase = reinterpret_cast<uintptr_t>(mod);
++                if (modBase == exeBase)
++                {
++                    std::snprintf(out, outSize, "exe+0x%llx", static_cast<unsigned long long>(addr - exeBase));
++                    return;
++                }
++                char path[MAX_PATH] = {};
++                GetModuleFileNameA(mod, path, MAX_PATH);
++                const char *file = path;
++                for (const char *p = path; *p; ++p)
++                {
++                    if (*p == '\\' || *p == '/')
++                    {
++                        file = p + 1;
++                    }
++                }
++                std::snprintf(out, outSize, "%s+0x%llx", file, static_cast<unsigned long long>(addr - modBase));
++                return;
++            }
++            std::snprintf(out, outSize, "abs:0x%llx", static_cast<unsigned long long>(addr));
++        }
++
++        // Walks the suspended thread's stack and stores up to maxFrames return
++        // addresses (frame 0 = current instruction). Returns the frame count.
++        int unwindStack(CONTEXT ctx, uint64_t *frames, int maxFrames)
++        {
++            int n = 0;
++#if defined(_M_X64)
++            __try
++            {
++                for (int i = 0; i < 64 && n < maxFrames; ++i)
++                {
++                    if (ctx.Rip == 0)
++                    {
++                        break;
++                    }
++                    frames[n++] = ctx.Rip;
++                    DWORD64 imageBase = 0;
++                    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
++                    if (fn == nullptr)
++                    {
++                        // Leaf function: return address is at [rsp].
++                        ctx.Rip = *reinterpret_cast<const DWORD64 *>(ctx.Rsp);
++                        ctx.Rsp += 8;
++                    }
++                    else
++                    {
++                        PVOID handlerData = nullptr;
++                        DWORD64 establisher = 0;
++                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &handlerData,
++                                         &establisher, nullptr);
++                    }
++                }
++            }
++            __except (EXCEPTION_EXECUTE_HANDLER)
++            {
++            }
++#else
++            frames[n++] = ctx.Eip;
++#endif
++            return n;
++        }
++    }
++
++    void start(void *gameThreadNativeHandle)
++    {
++        const char *outPath = std::getenv("PS2X_PROFILE");
++        if (outPath == nullptr || *outPath == '\0' || gameThreadNativeHandle == nullptr)
++        {
++            return;
++        }
++
++        const DWORD access = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION;
++        HANDLE gameHandle = nullptr;
++        HANDLE mainHandle = nullptr;
++        DuplicateHandle(GetCurrentProcess(), static_cast<HANDLE>(gameThreadNativeHandle), GetCurrentProcess(),
++                        &gameHandle, access, FALSE, 0);
++        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mainHandle, access, FALSE, 0);
++        if (gameHandle == nullptr)
++        {
++            return;
++        }
++
++        const std::string path(outPath);
++        const uintptr_t exeBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
++
++        std::thread([path, exeBase, gameHandle, mainHandle]()
++                    {
++            std::vector<Sampled> threads(2);
++            threads[0].handle = gameHandle;
++            threads[0].name = "game";
++            threads[1].handle = mainHandle;
++            threads[1].name = "main";
++
++            if (FILE *f = std::fopen(path.c_str(), "w"))
++            {
++                std::fprintf(f, "# ps2x host profile, exeBase=0x%llx, interval=10s\n",
++                             static_cast<unsigned long long>(exeBase));
++                std::fclose(f);
++            }
++
++            uint32_t interval = 0;
++            ULONGLONG last = GetTickCount64();
++            for (;;)
++            {
++                for (Sampled &t : threads)
++                {
++                    if (t.handle == nullptr)
++                    {
++                        continue;
++                    }
++                    if (SuspendThread(t.handle) == static_cast<DWORD>(-1))
++                    {
++                        ++t.failed;
++                        continue;
++                    }
++                    CONTEXT ctx{};
++                    ctx.ContextFlags = CONTEXT_FULL;
++                    const BOOL ok = GetThreadContext(t.handle, &ctx);
++                    uint64_t frames[48];
++                    int nframes = 0;
++                    if (ok)
++                    {
++                        nframes = unwindStack(ctx, frames, 48);
++                    }
++                    ResumeThread(t.handle);
++                    if (!ok || nframes == 0)
++                    {
++                        ++t.failed;
++                        continue;
++                    }
++                    // Key: the leaf location, then the first 6 frames inside the exe.
++                    char where[MAX_PATH + 64];
++                    describeAddress(frames[0], exeBase, where, sizeof(where));
++                    std::string key(where);
++                    key += " |";
++                    int exeFrames = 0;
++                    for (int i = 0; i < nframes && exeFrames < 6; ++i)
++                    {
++                        HMODULE mod = nullptr;
++                        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                               reinterpret_cast<LPCSTR>(frames[i]), &mod) &&
++                            reinterpret_cast<uintptr_t>(mod) == exeBase)
++                        {
++                            char buf[32];
++                            std::snprintf(buf, sizeof(buf), " exe+0x%llx",
++                                          static_cast<unsigned long long>(frames[i] - exeBase));
++                            key += buf;
++                            ++exeFrames;
++                        }
++                    }
++                    ++t.hist[key];
++                    ++t.total;
++                }
++
++                Sleep(1);
++
++                const ULONGLONG now = GetTickCount64();
++                if (now - last < 10000)
++                {
++                    continue;
++                }
++                last = now;
++                ++interval;
++
++                if (FILE *f = std::fopen(path.c_str(), "a"))
++                {
++                    for (Sampled &t : threads)
++                    {
++                        std::fprintf(f, "== interval %u thread=%s samples=%llu failed=%llu\n", interval, t.name,
++                                     static_cast<unsigned long long>(t.total),
++                                     static_cast<unsigned long long>(t.failed));
++                        std::vector<std::pair<std::string, uint32_t>> entries(t.hist.begin(), t.hist.end());
++                        std::sort(entries.begin(), entries.end(),
++                                  [](const auto &a, const auto &b) { return a.second > b.second; });
++                        size_t shown = 0;
++                        for (const auto &e : entries)
++                        {
++                            if (++shown > 60)
++                            {
++                                break;
++                            }
++                            std::fprintf(f, "%u %s\n", e.second, e.first.c_str());
++                        }
++                        t.hist.clear();
++                        t.total = 0;
++                        t.failed = 0;
++                    }
++                    std::fclose(f);
++                }
++            } })
++            .detach();
++    }
++}
++
++
++// ---------------------------------------------------------------------------
++// Host-side memory watchpoint (Windows only, opt-in, diagnostic).
++// PS2X_WATCH=<guest phys hex>,<length hex>: makes the host page(s) holding that
++// guest RAM range read-only. Every write to the page is caught; writes that hit
++// the watched range are logged with the writing instruction (exe offset, resolve
++// with the .map file). The write is then single-stepped and the page re-protected.
++// Output goes to PS2X_WATCH_LOG (default ps2x_watch.txt).
++namespace ps2x_watch
++{
++    namespace
++    {
++        uintptr_t g_pageBase = 0;
++        size_t g_pageLen = 0;
++        uintptr_t g_watchLo = 0;
++        uintptr_t g_watchHi = 0;
++        uintptr_t g_rdram = 0;
++        uintptr_t g_exeBase = 0;
++        FILE *g_log = nullptr;
++        thread_local bool t_rearm = false;
++        volatile LONG g_logged = 0;
++        constexpr int kMaxRips = 4096;
++        uint64_t g_rips[kMaxRips] = {};
++        uint32_t g_ripCounts[kMaxRips] = {};
++        thread_local uintptr_t t_pendingAddr = 0;
++
++        // First return addresses inside the exe (the writer's callers), for the log.
++        int callerFrames(CONTEXT ctx, uint64_t *out, int maxOut)
++        {
++            int n = 0;
++#if defined(_M_X64)
++            __try
++            {
++                for (int i = 0; i < 32 && n < maxOut; ++i)
++                {
++                    DWORD64 imageBase = 0;
++                    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
++                    if (fn == nullptr)
++                    {
++                        ctx.Rip = *reinterpret_cast<const DWORD64 *>(ctx.Rsp);
++                        ctx.Rsp += 8;
++                    }
++                    else
++                    {
++                        PVOID hd = nullptr;
++                        DWORD64 ef = 0;
++                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &hd, &ef, nullptr);
++                    }
++                    if (ctx.Rip == 0)
++                        break;
++                    if (ctx.Rip >= g_exeBase && ctx.Rip < g_exeBase + 0x40000000ull)
++                        out[n++] = ctx.Rip - g_exeBase;
++                }
++            }
++            __except (EXCEPTION_EXECUTE_HANDLER)
++            {
++            }
++#endif
++            return n;
++        }
++
++        LONG CALLBACK handler(EXCEPTION_POINTERS *info)
++        {
++            const DWORD code = info->ExceptionRecord->ExceptionCode;
++            if (code == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2 &&
++                info->ExceptionRecord->ExceptionInformation[0] == 1)
++            {
++                const uintptr_t addr = static_cast<uintptr_t>(info->ExceptionRecord->ExceptionInformation[1]);
++                if (addr < g_pageBase || addr >= g_pageBase + g_pageLen)
++                    return EXCEPTION_CONTINUE_SEARCH;
++#if defined(_M_X64)
++                const uint64_t rip = info->ContextRecord->Rip;
++#else
++                const uint64_t rip = info->ContextRecord->Eip;
++#endif
++                // Log at most 4 writes per distinct writing instruction, so one busy writer
++                // (e.g. the movie decoder filling a buffer) cannot use up the log.
++                bool logThis = false;
++                uint64_t callers[3] = {0, 0, 0};
++                int ncallers = 0;
++                uint64_t key = rip;
++                if (addr >= g_watchLo && addr < g_watchHi && g_log)
++                {
++                    ncallers = callerFrames(*info->ContextRecord, callers, 3);
++                    key = rip ^ (callers[0] * 0x9E3779B97F4A7C15ull) ^ (callers[1] * 0xC2B2AE3D27D4EB4Full);
++                    for (int k = 0; k < kMaxRips; ++k)
++                    {
++                        if (g_rips[k] == key)
++                        {
++                            logThis = ++g_ripCounts[k] <= 4u;
++                            break;
++                        }
++                        if (g_rips[k] == 0)
++                        {
++                            g_rips[k] = key;
++                            g_ripCounts[k] = 1u;
++                            logThis = true;
++                            break;
++                        }
++                    }
++                }
++                if (logThis && InterlockedIncrement(&g_logged) <= 20000)
++                {
++                    std::fprintf(g_log, "write guest=%08llx rip=exe+0x%llx thread=%lu tick=%llu callers=exe+0x%llx,exe+0x%llx,exe+0x%llx",
++                                 static_cast<unsigned long long>(addr - g_rdram),
++                                 static_cast<unsigned long long>(rip - g_exeBase), GetCurrentThreadId(),
++                                 static_cast<unsigned long long>(GetTickCount64()),
++                                 static_cast<unsigned long long>(callers[0]), static_cast<unsigned long long>(callers[1]),
++                                 static_cast<unsigned long long>(callers[2]));
++                    t_pendingAddr = addr; // value is logged after the write completes (single-step)
++                }
++                DWORD old = 0;
++                VirtualProtect(reinterpret_cast<void *>(g_pageBase), g_pageLen, PAGE_READWRITE, &old);
++                info->ContextRecord->EFlags |= 0x100u; // trap flag: re-protect after this instruction
++                t_rearm = true;
++                return EXCEPTION_CONTINUE_EXECUTION;
++            }
++            if (code == EXCEPTION_SINGLE_STEP && t_rearm)
++            {
++                t_rearm = false;
++                if (t_pendingAddr && g_log)
++                {
++                    const uintptr_t a = t_pendingAddr & ~static_cast<uintptr_t>(15);
++                    uint32_t v[4] = {};
++                    std::memcpy(v, reinterpret_cast<const void *>(a), sizeof(v));
++                    std::fprintf(g_log, " qword@%08llx=%08x %08x %08x %08x\n",
++                                 static_cast<unsigned long long>(a - g_rdram), v[0], v[1], v[2], v[3]);
++                    std::fflush(g_log);
++                    t_pendingAddr = 0;
++                }
++                DWORD old = 0;
++                VirtualProtect(reinterpret_cast<void *>(g_pageBase), g_pageLen, PAGE_READONLY, &old);
++                return EXCEPTION_CONTINUE_EXECUTION;
++            }
++            return EXCEPTION_CONTINUE_SEARCH;
++        }
++    }
++
++    void arm(uint8_t *rdram)
++    {
++        const char *spec = std::getenv("PS2X_WATCH");
++        if (!spec || !*spec || !rdram)
++            return;
++        unsigned long long guest = 0, len = 0x40;
++        if (std::sscanf(spec, "%llx,%llx", &guest, &len) < 1 || len == 0)
++            return;
++        const char *logPath = std::getenv("PS2X_WATCH_LOG");
++        g_log = std::fopen(logPath && *logPath ? logPath : "ps2x_watch.txt", "w");
++        g_rdram = reinterpret_cast<uintptr_t>(rdram);
++        g_exeBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
++        g_watchLo = g_rdram + guest;
++        g_watchHi = g_watchLo + len;
++        SYSTEM_INFO si{};
++        GetSystemInfo(&si);
++        const uintptr_t page = si.dwPageSize;
++        g_pageBase = g_watchLo & ~(page - 1);
++        g_pageLen = ((g_watchHi + page - 1) & ~(page - 1)) - g_pageBase;
++        if (g_log)
++        {
++            std::fprintf(g_log, "# watch guest %llx..%llx exeBase=0x%llx\n", guest, guest + len,
++                         static_cast<unsigned long long>(g_exeBase));
++            std::fflush(g_log);
++        }
++        AddVectoredExceptionHandler(1, handler);
++        DWORD old = 0;
++        VirtualProtect(reinterpret_cast<void *>(g_pageBase), g_pageLen, PAGE_READONLY, &old);
++    }
++}
++
++#else
++
++namespace ps2x_prof
++{
++    void start(void *)
++    {
++    }
++}
++namespace ps2x_watch
++{
++    void arm(uint8_t *)
++    {
++    }
++}
++
++#endif
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
 index b32e44a..e5e8a20 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
@@ -1438,7 +1972,7 @@ index 1e38bd4..392d799 100644
 +// Per-game override modules
 +#include "game_overrides/shadow_hearts_covenant_usa.inl"
 diff --git a/ps2xRuntime/src/lib/game_overrides/shadow_hearts_covenant_usa.inl b/ps2xRuntime/src/lib/game_overrides/shadow_hearts_covenant_usa.inl
-new file mode 100644
+new file mode 100755
 index 0000000..a4d2ceb
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/game_overrides/shadow_hearts_covenant_usa.inl
@@ -1501,10 +2035,53 @@ index 6bd1835..a149992 100644
      {
          return !runtime || runtime->canBindIopRpc(sid);
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 37b6a4d..3151245 100644
+index 37b6a4d..32b3f6f 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
-@@ -402,6 +402,10 @@ bool PS2Memory::initialize(size_t ramSize)
+@@ -8,6 +8,42 @@
+ #include <stdexcept>
+ #include <algorithm>
+ #include <string>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++
++// Diagnostic: raw GIF packet capture (started by the runner's F9 GS snapshot).
++// Each record: "GIFP", u32 path (1-3 = PATH1-3, 4 = native packed DMA), u32 size, bytes.
++namespace
++{
++    std::mutex g_gifCaptureMutex;
++    FILE *g_gifCaptureFile = nullptr;
++    uint32_t g_gifCaptureRemaining = 0;
++
++    void gifCaptureRecord(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
++    {
++        std::lock_guard<std::mutex> lock(g_gifCaptureMutex);
++        if (!g_gifCaptureFile || !data)
++            return;
++        const uint32_t header[3] = {0x50464947u, path, sizeBytes};
++        std::fwrite(header, sizeof(header), 1, g_gifCaptureFile);
++        std::fwrite(data, 1, sizeBytes, g_gifCaptureFile);
++        if (--g_gifCaptureRemaining == 0u)
++        {
++            std::fclose(g_gifCaptureFile);
++            g_gifCaptureFile = nullptr;
++        }
++    }
++}
++
++void ps2x_gifCaptureStart(const char *path, uint32_t packets)
++{
++    std::lock_guard<std::mutex> lock(g_gifCaptureMutex);
++    if (g_gifCaptureFile || !path || packets == 0u)
++        return;
++    g_gifCaptureFile = std::fopen(path, "wb");
++    g_gifCaptureRemaining = packets;
++}
+ #include <vector>
+ 
+ namespace
+@@ -402,6 +438,10 @@ bool PS2Memory::initialize(size_t ramSize)
  void PS2Memory::resetEeTimers() noexcept
  {
      m_eeTimers = {};
@@ -1515,8 +2092,24 @@ index 37b6a4d..3151245 100644
  }
  
  uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+@@ -1947,6 +1987,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+ {
+     if (!data || sizeBytes < 16)
+         return;
++    gifCaptureRecord(static_cast<uint32_t>(pathId), data, sizeBytes);
+ 
+     if (pathId == GifPathId::Path3)
+     {
+@@ -2247,6 +2288,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
+     const uint8_t *payload = nullptr;
+     if (!resolveContiguous(tadr + 16u, payloadBytes, payload))
+         return false;
++    gifCaptureRecord(4u, payload, payloadBytes);
+     if (!gs.processNativePackedGIFPacket(payload, payloadBytes))
+         return false;
+ 
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..79318fd 100644
+index 45cb9d2..36a00a3 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,4 @@
@@ -1532,7 +2125,18 @@ index 45cb9d2..79318fd 100644
  #include <limits>
  #include <chrono>
  #include <atomic>
-@@ -1065,6 +1067,14 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+@@ -27,6 +29,10 @@
+ #include <unordered_map>
+ #include <sstream>
+ 
++namespace ps2x_prof { void start(void *gameThreadNativeHandle); }
++namespace ps2x_watch { void arm(uint8_t *rdram); }
++void ps2x_gifCaptureStart(const char *path, uint32_t packets);
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -1065,6 +1071,14 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
          paths.mcRoot = paths.elfDirectory / "mc0";
      }
  
@@ -1547,7 +2151,7 @@ index 45cb9d2..79318fd 100644
      setIoPaths(paths);
  }
  
-@@ -1109,10 +1119,94 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
+@@ -1109,10 +1123,94 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
      return replaceFunction(address, func);
  }
  
@@ -1643,7 +2247,7 @@ index 45cb9d2..79318fd 100644
  }
  
  const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
-@@ -1147,6 +1241,10 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+@@ -1147,6 +1245,10 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
              return fn;
          }
      }
@@ -1654,7 +2258,46 @@ index 45cb9d2..79318fd 100644
  
      std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
                << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
-@@ -2410,6 +2508,8 @@ void PS2Runtime::run()
+@@ -2364,6 +2466,9 @@ void PS2Runtime::run()
+ 
+     std::atomic<bool> gameThreadFinished{false};
+ 
++    // Opt-in host memory watchpoint on guest RAM (PS2X_WATCH=<phys hex>,<len hex>); no-op otherwise.
++    ps2x_watch::arm(m_memory.getRDRAM());
++
+     std::thread gameThread([&]()
+                            {
+         ThreadNaming::SetCurrentThreadName("GameThread");
+@@ -2385,9 +2490,28 @@ void PS2Runtime::run()
+         }
+         gameThreadFinished.store(true, std::memory_order_release); });
+ 
++    // PS2X_GSDUMP snapshots include the GS event history, which is paused by default.
++    if (std::getenv("PS2X_GSDUMP"))
++    {
++        m_gs.setDebugHistoryPaused(false);
++    }
++
++    // Opt-in host sampling profiler (PS2X_PROFILE=<file>); no-op otherwise.
++    ps2x_prof::start(reinterpret_cast<void *>(gameThread.native_handle()));
++
+     uint64_t tick = 0;
++    bool gsDumpRequested = false; // F9 requests a PS2X_GSDUMP snapshot
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
++        if (IsKeyPressed(KEY_F9))
++        {
++            gsDumpRequested = true;
++            if (const char *gsPath = std::getenv("PS2X_GSDUMP"))
++            {
++                // Also capture the next 3000 raw GIF packets to <file>.gif.
++                ps2x_gifCaptureStart((std::string(gsPath) + ".gif").c_str(), 3000u);
++            }
++        }
+         PS2_IF_AGRESSIVE_LOGS({
+             tick++;
+             if ((tick % 120) == 0)
+@@ -2410,6 +2534,8 @@ void PS2Runtime::run()
                                                 << " gp=0x" << dbgGp
                                                 << " dispfb1=0x" << gs.dispfb1
                                                 << " display1=0x" << gs.display1
@@ -1663,7 +2306,7 @@ index 45cb9d2..79318fd 100644
                                                 << std::dec
                                                 << " activeThreads=" << eeSnapshot.threads.size()
                                                 << " dma=" << curDma
-@@ -2417,6 +2517,37 @@ void PS2Runtime::run()
+@@ -2417,6 +2543,133 @@ void PS2Runtime::run()
                                                 << " gsw=" << curGs
                                                 << " vif=" << curVif
                                                 << std::endl);
@@ -1695,6 +2338,102 @@ index 45cb9d2..79318fd 100644
 +                            std::fwrite(rd, 1, 32u * 1024u * 1024u, df);
 +                            std::fclose(df);
 +                            RUNTIME_LOG("[run:dump] wrote " << dumpPath << std::endl);
++                        }
++                    }
++                    // PS2X_GSDUMP=<file>, then press F9 (or set PS2X_GSDUMPTICK=<tick>): write GS VRAM (4 MB) to <file>
++                    // and the GS registers plus the last ~512 GS events as text to <file>.txt.
++                    if (const char *gsPath = std::getenv("PS2X_GSDUMP"); gsPath && (gsDumpRequested || tick == static_cast<uint64_t>(std::atoi(std::getenv("PS2X_GSDUMPTICK") ? std::getenv("PS2X_GSDUMPTICK") : "0"))))
++                    {
++                        gsDumpRequested = false;
++                        if (FILE *vf = std::fopen(gsPath, "wb"))
++                        {
++                            std::fwrite(m_memory.getGSVRAM(), 1, PS2_GS_VRAM_SIZE, vf);
++                            std::fclose(vf);
++                        }
++                        // Main RAM (32 MB) -> <file>.ram
++                        if (FILE *rf = std::fopen((std::string(gsPath) + ".ram").c_str(), "wb"))
++                        {
++                            std::fwrite(m_memory.getRDRAM(), 1, 32u * 1024u * 1024u, rf);
++                            std::fclose(rf);
++                        }
++                        // VU1 micro memory (16 KB) followed by VU1 data memory (16 KB) -> <file>.vu1
++                        if (FILE *uf = std::fopen((std::string(gsPath) + ".vu1").c_str(), "wb"))
++                        {
++                            std::fwrite(m_memory.getVU1Code(), 1, 16u * 1024u, uf);
++                            std::fwrite(m_memory.getVU1Data(), 1, 16u * 1024u, uf);
++                            std::fclose(uf);
++                        }
++                        const std::string txtPath = std::string(gsPath) + ".txt";
++                        if (FILE *tf = std::fopen(txtPath.c_str(), "w"))
++                        {
++                            const GSRegisters &pr = m_memory.gs();
++                            std::fprintf(tf, "pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bgcolor=%llx\n",
++                                         (unsigned long long)pr.pmode, (unsigned long long)pr.smode2, (unsigned long long)pr.dispfb1,
++                                         (unsigned long long)pr.display1, (unsigned long long)pr.dispfb2, (unsigned long long)pr.display2,
++                                         (unsigned long long)pr.bgcolor);
++                            const GSDebugSnapshot snap = m_gs.getDebugSnapshot();
++                            for (int c = 0; c < 2; ++c)
++                            {
++                                const GSContext &cx = snap.ctx[c];
++                                std::fprintf(tf, "ctx%d frame fbp=%u fbw=%u psm=%u fbmsk=%08x zbuf zbp=%u psm=%u zmask=%d scissor=%u,%u-%u,%u test=%llx alpha=%llx\n",
++                                             c, cx.frame.fbp, cx.frame.fbw, cx.frame.psm, cx.frame.fbmsk, cx.zbuf.zbp, cx.zbuf.psm, cx.zbuf.zmask ? 1 : 0,
++                                             cx.scissor.x0, cx.scissor.y0, cx.scissor.x1, cx.scissor.y1,
++                                             (unsigned long long)cx.test, (unsigned long long)cx.alpha);
++                            }
++                            std::fprintf(tf, "present w=%u h=%u displayFbp=%u sourceFbp=%u\n", snap.hostPresentationWidth,
++                                         snap.hostPresentationHeight, snap.hostPresentationDisplayFbp, snap.hostPresentationSourceFbp);
++                            for (const GSDebugHistoryEntry &e : m_gs.getDebugHistory())
++                            {
++                                std::fprintf(tf, "#%llu v=%llu f=%u kind=%u reg=%02x val=%llx", (unsigned long long)e.seq,
++                                             (unsigned long long)e.vsyncTick, e.frameIndex, (unsigned)e.kind, e.reg,
++                                             (unsigned long long)e.regValue);
++                                if (e.kind == GSDebugEventKind::Draw)
++                                {
++                                    std::fprintf(tf, " prim=%u tme=%d abe=%d ctxt=%d fbp=%u fbw=%u fpsm=%u fbmsk=%08x zbp=%u zpsm=%u zmask=%d tbp0=%u tbw=%u tpsm=%u tw=%u th=%u tfx=%u tcc=%u cbp=%u test=%llx alpha=%llx n=%u x=%.1f..%.1f y=%.1f..%.1f z=%.0f..%.0f a=%u..%u sc=%u,%u-%u,%u",
++                                                 (unsigned)e.prim.type, e.prim.tme, e.prim.abe, e.prim.ctxt, e.frame.fbp, e.frame.fbw, e.frame.psm, e.frame.fbmsk,
++                                                 e.zbuf.zbp, e.zbuf.psm, e.zbuf.zmask ? 1 : 0, e.tex0.tbp0, e.tex0.tbw, e.tex0.psm, e.tex0.tw, e.tex0.th, e.tex0.tfx, e.tex0.tcc, e.tex0.cbp,
++                                                 (unsigned long long)e.test, (unsigned long long)e.alpha, e.vertexCount, e.xMin, e.xMax, e.yMin, e.yMax, e.zMin, e.zMax,
++                                                 e.aMin, e.aMax, e.scissor.x0, e.scissor.y0, e.scissor.x1, e.scissor.y1);
++                                }
++                                else if (e.kind == GSDebugEventKind::Transfer)
++                                {
++                                    std::fprintf(tf, " dbp=%u dbw=%u dpsm=%u dir=%u px=%u", e.bitbltbuf.dbp, e.bitbltbuf.dbw, e.bitbltbuf.dpsm, e.trxdir, e.transferPixels);
++                                }
++                                else if (e.kind == GSDebugEventKind::GifTag)
++                                {
++                                    std::fprintf(tf, " nloop=%u flg=%u nreg=%u bytes=%u", e.gifNloop, e.gifFlg, e.gifNreg, e.gifSizeBytes);
++                                }
++                                else if (e.kind == GSDebugEventKind::Present)
++                                {
++                                    std::fprintf(tf, " displayFbp=%u sourceFbp=%u %ux%u", e.displayFbp, e.sourceFbp, e.width, e.height);
++                                }
++                                std::fprintf(tf, "\n");
++                            }
++                            std::fclose(tf);
++                        }
++                        RUNTIME_LOG("[run:gsdump] wrote " << gsPath << std::endl);
++                    }
++                    auto w = [&](uint32_t a) { uint32_t v; std::memcpy(&v, rd + (a & 0x1FFFFFFu), 4); return v; };
++                    RUNTIME_LOG("[run:shc] fio busy=0x" << std::hex << w(0x43FC60) << " en=0x" << w(0x43FC58)
++                                                        << " blk=0x" << w(0x43FA88) << " last=0x" << w(0x43FC84)
++                                                        << " q=0x" << w(0x44A428) << " t0irq=" << std::dec << w(0x43FE9C)
++                                                        << std::hex << " T0mode=0x" << m_memory.readIORegister(0x10000010)
++                                                        << " T0cnt=0x" << m_memory.readIORegister(0x10000000)
++                                                        << " T0cmp=0x" << m_memory.readIORegister(0x10000020)
++                                                        << " imask=0x" << m_memory.readIORegister(0x1000F010)
++                                                        << std::dec << std::endl);
++                    for (uint32_t headAddr : {0x43FE98u, 0x43FE94u})
++                    {
++                        uint32_t node = w(headAddr);
++                        for (int n = 0; n < 12 && node != 0u; ++n)
++                        {
++                            const uint32_t c = w(node + 0xC);
++                            RUNTIME_LOG("[run:task] list=0x" << std::hex << headAddr << " node=0x" << node
++                                                             << " type=" << (w(node + 4) & 0xFF) << " flags=0x" << (w(node + 8) & 0xFF)
++                                                             << " target=0x" << c << " tid=" << (c ? w(c) : 0u)
++                                                             << " cnt=" << std::dec << w(node + 0x10) << " period=" << w(node + 0x14)
++                                                             << " runs=" << w(node + 0x18) << std::endl);
++                            node = w(node);
 +                        }
 +                    }
 +                }

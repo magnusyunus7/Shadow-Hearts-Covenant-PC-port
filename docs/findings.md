@@ -49,6 +49,13 @@ get merged unless listed as entry points (`addctors.py`).
 * Module lookup protocol (IOPUTY "sifc"): IOPUTY = cmd 0, FIO = 1, SDRV = 2.
 * FIO.IRX needs `SetAlarm`/`iSetAlarm` (thbase 35–38) and `sceSifSetDmaIntr` (sifman 32).
 
+## Recompilation gaps
+
+* Small functions placed right after another function's `jr ra` (plus `nop` padding) and reached
+  only through pointers get merged into the previous function, so they have no entry point
+  (example: `0x24C930`, `0x24CFE0`). Scanning for non-entry code that follows a `jr ra` delay slot
+  found 175 such addresses; all are entry points now.
+
 ## EE kernel behaviour the game depends on
 
 * **Timer 3** must free-run at the H-blank rate. The game reads it in 18 places and never sets it up
@@ -64,7 +71,16 @@ get merged unless listed as entry points (`addctors.py`).
 
 * `sceGsSetDefDispEnv` (`0x200508`) stores **PMODE = 0x66** and SMODE2 = 1/2/3 in the env. A stub
   that leaves them zero switches the display off (the pink screen).
-* The game flips between framebuffers 0 and 140 (PSMCT24), 640×448.
+* The game flips between framebuffers 0 and 140 (PSMCT24), 640×448. In-engine 3D scenes use
+  512×448 buffers at FBP 0 and 112.
+* 3D models go through VU1. The microprogram transforms vertices with the object matrix it loads from
+  VU1 data rows 19–22 (projection in rows 14–17). The EE uploads the object matrix each frame with a
+  DMA `REF` tag whose VIF code is `UNPACK V4-32, 4 qwords, row 19` (built at `0x257318`), from a
+  double-buffered slot at object `+0xB0`/`+0xF0` selected by the frame-parity byte at `0x43FC30`.
+* `0x24A530` computes that matrix as camera matrix (`*(gp-0x7B44)+0x280`) × bone matrix, with VU0
+  macro instructions. Bone matrices are built by `0x240E80`, starting from an identity matrix made
+  from `vf0` with `VMR32`. **VU0 `vf0` must read (0, 0, 0, 1) on every thread**; with zero the whole
+  chain is zero and nothing is drawn.
 
 ## Movies
 

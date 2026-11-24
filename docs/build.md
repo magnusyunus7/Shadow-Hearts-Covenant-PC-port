@@ -70,22 +70,38 @@ python scripts\ovlbank.py <that folder> ZMAIN - C:\shc\port\ps2xRuntime\src\runn
 
 ```powershell
 cmake -S . -B out/dbg -G "Visual Studio 17 2022" -A x64 -DCMAKE_UNITY_BUILD=ON -DCMAKE_UNITY_BUILD_BATCH_SIZE=8
-cmake --build out/dbg --config Debug -- /m:1
+cmake --build out/dbg --config Release --target ps2EntryRunner -- /m:1 /p:CL_MPCount=1
 ```
 
-Use a Debug build: Release (`/fp:fast` + LTO) needed more than 8 GB and over 40 minutes to link.
-The largest generated function is 6.4 MB; `scripts/deopt_huge.py` turns optimisation off for files
-over 1 MB if you build optimised.
+Use **Release**: it runs about 10–15x faster than Debug. On 8 GB RAM build one file at a time
+(`/m:1 /p:CL_MPCount=1`). The patched `CMakeLists.txt` compiles generated files over 1 MB on their
+own, unoptimised and without the precompiled header; otherwise `cl.exe` runs out of heap (`C1002`).
+The first Release build takes a long time; later builds only recompile what changed.
+
+If linking fails with `LNK2001 unresolved external` after runner files were added or removed, the
+unity batches were renumbered while the old project was loaded: run the same build command again,
+or delete the stale `unity_*.obj` files it names.
 
 ## 6. Run
 
 ```powershell
 $env:PS2X_CD_IMAGE = "C:\shc\iso\Shadow Hearts - Covenant (USA) (Disc 1).iso"
-$env:PS2X_SIFDIAG = "1"     # optional diagnostics
-.\out\dbg\ps2xRuntime\Debug\ps2EntryRunner.exe C:\shc\extracted\disc1\SLUS_210.41 > run.log 2>&1
+.\out\dbg\ps2xRuntime\Release\ps2EntryRunner.exe C:\shc\extracted\disc1\SLUS_210.41 > run.log 2>&1
 ```
 
+Keyboard: arrows = d-pad, Z/X/C/V = square/cross/circle/triangle, Q/E = L1/R1, 1/3 = L2/R2,
+Enter = START, Right Shift = SELECT, WASD = left stick. The first connected gamepad also works.
 F1 toggles the debug panel.
 
-Diagnostics: `PS2X_DUMPRAM=<file>` with `PS2X_DUMPTICK=<n>` writes the 32 MB EE RAM at tick n.
-The dump contains game data, so never commit it.
+### Diagnostics (all optional, off by default)
+
+| Variable | Effect |
+|---|---|
+| `PS2X_SIFDIAG=1` | SIF/IOP logs plus a thread, semaphore and DMA summary every 120 ticks |
+| `PS2X_FNTRACE=1` | enter/exit trace of every recompiled function to `ps2_log.txt` (very slow, huge file) |
+| `PS2X_PROFILE=<file>` | Windows: samples the game and render threads every ~1 ms; offsets resolve with `ps2EntryRunner.map` |
+| `PS2X_GSDUMP=<file>` | F9 writes GS VRAM, GS registers and recent GS events (`.txt`), VU1 code+data (`.vu1`), EE RAM (`.ram`) and the next 3000 GIF packets (`.gif`) |
+| `PS2X_WATCH=<addr>,<len>` | Windows: logs every host write to that guest RAM range with the writing function and its callers (`PS2X_WATCH_LOG=<file>`) |
+| `PS2X_DUMPRAM=<file>`, `PS2X_DUMPTICK=<n>` | writes the 32 MB EE RAM at tick n (a multiple of 120) |
+
+Dumps and captures contain game data: never commit them.
