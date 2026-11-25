@@ -568,7 +568,7 @@ index 589d768..42f8470 100644
  
  target_include_directories(ps2_runtime PUBLIC
 diff --git a/ps2xRuntime/include/ps2_log.h b/ps2xRuntime/include/ps2_log.h
-index a42b1ba..d0a94de 100644
+index a42b1ba..aeb9672 100644
 --- a/ps2xRuntime/include/ps2_log.h
 +++ b/ps2xRuntime/include/ps2_log.h
 @@ -2,6 +2,7 @@
@@ -579,7 +579,7 @@ index a42b1ba..d0a94de 100644
  #include <deque>
  #include <filesystem>
  #include <fstream>
-@@ -160,8 +161,22 @@ inline int &depth()
+@@ -160,8 +161,27 @@ inline int &depth()
      static thread_local int d = 0;
      return d;
  }
@@ -595,14 +595,19 @@ index a42b1ba..d0a94de 100644
 +    }();
 +    return enabled;
 +}
++// Optional per-function hook for diagnostics, set at startup by runtime .cpp code (null = off).
++// It lives here so new function-level diagnostics only need a .cpp change, never a full rebuild.
++extern void (*g_ps2xFnEntryHook)(const char *name);
  inline void log_entry(const char *name)
  {
++    if (g_ps2xFnEntryHook)
++        g_ps2xFnEntryHook(name);
 +    if (!fn_trace_enabled())
 +        return;
      for (int i = 0; i < depth(); ++i)
          log_stream() << '\t';
      log_stream() << ">> " << name << " enter\n";
-@@ -170,6 +185,8 @@ inline void log_entry(const char *name)
+@@ -170,6 +190,8 @@ inline void log_entry(const char *name)
  }
  inline void log_exit(const char *name)
  {
@@ -634,6 +639,23 @@ index f247ff9..0ca4e58 100644
      void processPendingEvents();
      void processDueDeadlines();
      void processEvent(const EeEvent &event);
+diff --git a/ps2xRuntime/include/runtime/gs/gs_types.h b/ps2xRuntime/include/runtime/gs/gs_types.h
+index 836a3ff..e30ea53 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -288,6 +288,12 @@ struct GSPresentationRequest
+     GSFrameReg preferredSource{};
+     uint32_t preferredDestFbp = 0;
+     bool hasPreferredSource = false;
++    // Optional: re-reads the display registers while the backend holds its VRAM lock, so the
++    // displayed-buffer choice and the VRAM snapshot are taken at the same instant. Without it the
++    // game thread can flip and start redrawing the buffer between the two, and the host shows a
++    // half-drawn frame (flicker).
++    void (*refreshUnderLock)(void *user, GSPresentationRequest &request) = nullptr;
++    void *refreshUser = nullptr;
+ };
+ 
+ struct PresentationFrame
 diff --git a/ps2xRuntime/include/runtime/ps2_overlay_banks.h b/ps2xRuntime/include/runtime/ps2_overlay_banks.h
 new file mode 100755
 index 0000000..82ebe9f
@@ -695,15 +717,46 @@ index 0000000..82ebe9f
 +                    const Run *runs, uint32_t runCount);
 +}
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..9f08564 100644
+index c5e31c4..d235d72 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,5 @@
++#include <cstdio>
 +#include "ps2x/iop/sif_diag.h"
  #include "runtime/ee_scheduler.h"
  
  #include "ps2_log.h"
-@@ -254,7 +255,18 @@ void EeScheduler::run()
+@@ -9,6 +11,20 @@
+ #include <limits>
+ #include <stdexcept>
+ 
++namespace
++{
++    // Diagnostic: last scheduler dispatches (printed with [sched:badpc]).
++    struct DispatchRecord
++    {
++        int thread;
++        uint32_t entered, spIn, raIn, returned, spOut, raOut;
++        int invKind;
++    };
++    DispatchRecord g_dispatchRing[64]{};
++    uint32_t g_dispatchRingPos = 0u;
++}
++#include <cstdlib>
++
+ namespace
+ {
+     constexpr int KE_OK = 0;
+@@ -152,6 +168,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     publishSnapshot();
+ }
+ 
++
++
+ void EeScheduler::run()
+ {
+     assertExecutor();
+@@ -254,7 +272,18 @@ void EeScheduler::run()
              continue;
          }
  
@@ -723,16 +776,90 @@ index c5e31c4..9f08564 100644
          {
              GuestInvocation invocation = std::move(m_pendingInvocations.front());
              m_pendingInvocations.pop_front();
-@@ -314,7 +326,7 @@ void EeScheduler::run()
+@@ -286,12 +315,22 @@ void EeScheduler::run()
+             continue;
+         }
+         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
++        // VU0 vf0 is hardwired to (0, 0, 0, 1). Interrupt, alarm and callback invocations start
++        // from fresh contexts too, so enforce it for every dispatch, not only for new threads.
++        context.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+ 
+         if (checkpointDue(kGuestDispatchCycles))
+         {
+             continue;
          }
  
++        // Diagnostic (PS2X_SIFDIAG): remember what was entered, to report a later jump to non-code.
++        const int badPcThreadId = running->id;
++        const uint32_t badPcEntered = context.pc;
++        const size_t badPcInvocations = running->invocations.size();
++        const int badPcInvKind = running->invocations.empty() ? -1 : static_cast<int>(running->invocations.back().kind);
++        const uint32_t badPcSpIn = getRegU32(&context, 29);
++        const uint32_t badPcRaIn = getRegU32(&context, 31);
+         try
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+@@ -313,8 +352,58 @@ void EeScheduler::run()
+             throw;
+         }
+ 
++        {
++            static const bool badPcDiag = std::getenv("PS2X_SIFDIAG") != nullptr;
++            static uint32_t badPcLogs = 0u;
++            if (badPcDiag)
++            {
++                DispatchRecord &rec = g_dispatchRing[g_dispatchRingPos++ % 64u];
++                rec.thread = badPcThreadId;
++                rec.entered = badPcEntered;
++                rec.spIn = badPcSpIn;
++                rec.raIn = badPcRaIn;
++                rec.invKind = badPcInvKind;
++                rec.returned = rec.spOut = rec.raOut = 0u;
++                if (GuestThread *t = thread(badPcThreadId))
++                {
++                    const R5900Context &c = t->activeContext();
++                    rec.returned = c.pc;
++                    rec.spOut = getRegU32(&c, 29);
++                    rec.raOut = getRegU32(&c, 31);
++                }
++            }
++            if (badPcDiag && badPcLogs < 8u)
++            {
++                if (GuestThread *t = thread(badPcThreadId))
++                {
++                    const R5900Context &c = t->activeContext();
++                    if (c.pc != 0u && !m_runtime.hasFunction(c.pc))
++                    {
++                        ++badPcLogs;
++                        for (uint32_t k = 0; k < 64u; ++k)
++                        {
++                            const DispatchRecord &r = g_dispatchRing[(g_dispatchRingPos + k) % 64u];
++                            if (r.entered == 0u)
++                                continue;
++                            RUNTIME_LOG("[sched:ring] t=" << r.thread << " enter=0x" << std::hex << r.entered
++                                        << " spIn=0x" << r.spIn << " raIn=0x" << r.raIn << " -> pc=0x" << r.returned
++                                        << " spOut=0x" << r.spOut << " raOut=0x" << r.raOut << std::dec
++                                        << " inv=" << r.invKind << std::endl);
++                        }
++                        RUNTIME_LOG("[sched:badpc] thread=" << badPcThreadId << " entered=0x" << std::hex << badPcEntered
++                                    << " now pc=0x" << c.pc << " ra=0x" << getRegU32(&c, 31) << " sp=0x" << getRegU32(&c, 29)
++                                    << " s0=0x" << getRegU32(&c, 16) << " v0=0x" << getRegU32(&c, 2) << std::dec
++                                    << " invBefore=" << badPcInvocations << " invKindBefore=" << badPcInvKind
++                                    << " invAfter=" << t->invocations.size()
++                                    << " invKindAfter=" << (t->invocations.empty() ? -1 : static_cast<int>(t->invocations.back().kind))
++                                    << " current=" << m_currentThreadId << std::endl);
++                    }
++                }
++            }
++        }
++
          processPendingEvents();
 -        if (m_rescheduleRequested && m_currentThreadId != 0)
 +        if (m_rescheduleRequested && m_currentThreadId != 0 && !runningInInterruptContext())
          {
              GuestThread *preempted = currentThread();
              assert(preempted != nullptr);
-@@ -377,13 +389,16 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -377,13 +466,16 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
      }
  
      const GuestThread *running = currentThread();
@@ -750,7 +877,7 @@ index c5e31c4..9f08564 100644
      renewTimeSlice();
      return false;
  }
-@@ -445,6 +460,7 @@ int EeScheduler::createThread(const EeThreadCreateParams &params)
+@@ -445,6 +537,7 @@ int EeScheduler::createThread(const EeThreadCreateParams &params)
      thread.initialPriority = params.priority;
      thread.currentPriority = params.priority;
      thread.status = EeThreadStatus::Dormant;
@@ -758,7 +885,7 @@ index c5e31c4..9f08564 100644
      m_threads.emplace(id, std::move(thread));
      publishSnapshot();
      return id;
-@@ -490,6 +506,10 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+@@ -490,6 +583,10 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
      }
  
      target->context = R5900Context{};
@@ -769,7 +896,7 @@ index c5e31c4..9f08564 100644
      target->context.pc = target->entry;
      target->arg = arg;
      target->suspendCount = 0;
-@@ -1516,6 +1536,16 @@ void EeScheduler::publishSnapshot()
+@@ -1516,6 +1613,16 @@ void EeScheduler::publishSnapshot()
          snapshot.suspendCount = item.suspendCount;
          snapshot.wakeupCount = item.wakeupCount;
          snapshot.invocationDepth = static_cast<uint32_t>(item.invocations.size());
@@ -786,7 +913,7 @@ index c5e31c4..9f08564 100644
          next.threads.push_back(snapshot);
      }
      std::sort(next.threads.begin(), next.threads.end(), [](const auto &left, const auto &right)
-@@ -1709,6 +1739,15 @@ void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
+@@ -1709,6 +1816,15 @@ void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
  void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe)
  {
      const GuestThread *running = currentThread();
@@ -802,7 +929,7 @@ index c5e31c4..9f08564 100644
      if (!running || readyThread.currentPriority >= running->currentPriority)
      {
          return;
-@@ -1720,12 +1759,47 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
+@@ -1720,12 +1836,47 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
      }
  }
  
@@ -852,10 +979,10 @@ index c5e31c4..9f08564 100644
          m_rescheduleRequested = false;
 diff --git a/ps2xRuntime/src/lib/Kernel/HostProfiler.cpp b/ps2xRuntime/src/lib/Kernel/HostProfiler.cpp
 new file mode 100755
-index 0000000..d81b7da
+index 0000000..42ebd89
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/Kernel/HostProfiler.cpp
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,442 @@
 +// Host-side sampling profiler (Windows only, opt-in).
 +//
 +// Set PS2X_PROFILE=<output file> before starting the runner. A background thread
@@ -868,6 +995,7 @@ index 0000000..d81b7da
 +
 +#include <cstdint>
 +#include <cstdlib>
++#include <cstdio>
 +
 +#if defined(_WIN32)
 +
@@ -1242,11 +1370,19 @@ index 0000000..d81b7da
 +        }
 +    }
 +
-+    void arm(uint8_t *rdram)
++    // PS2X_WATCH watches guest RAM; PS2X_WATCH_VRAM=<byte offset hex>,<len hex> watches GS VRAM instead
++    // (offsets in the log are then VRAM byte offsets).
++    void arm(uint8_t *rdram, uint8_t *vram)
 +    {
-+        const char *spec = std::getenv("PS2X_WATCH");
-+        if (!spec || !*spec || !rdram)
++        static bool armed = false;
++        const char *vramSpec = std::getenv("PS2X_WATCH_VRAM");
++        const bool useVram = vramSpec && *vramSpec && vram;
++        const char *spec = useVram ? vramSpec : std::getenv("PS2X_WATCH");
++        if (useVram)
++            rdram = vram;
++        if (armed || !spec || !*spec || !rdram)
 +            return;
++        armed = true;
 +        unsigned long long guest = 0, len = 0x40;
 +        if (std::sscanf(spec, "%llx,%llx", &guest, &len) < 1 || len == 0)
 +            return;
@@ -1283,7 +1419,7 @@ index 0000000..d81b7da
 +}
 +namespace ps2x_watch
 +{
-+    void arm(uint8_t *)
++    void arm(uint8_t *, uint8_t *)
 +    {
 +    }
 +}
@@ -1499,10 +1635,17 @@ index b1bb6d8..f713c29 100644
          }
  
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index 44eaef4..5d0e209 100644
+index 44eaef4..567406b 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-@@ -541,6 +541,9 @@ namespace ps2_stubs
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "MPEG.h"
++#include <cstdint>
+ #include "runtime/ee_scheduler.h"
+ 
+ #if !defined(PS2X_HAS_FFMPEG)
+@@ -541,6 +542,9 @@ namespace ps2_stubs
              uint32_t pictureTraceCount = 0u;
              uint32_t isEndTraceCount = 0u;
              std::unordered_map<uint32_t, std::vector<MpegRegisteredCallback>> callbacksByMpeg;
@@ -1512,7 +1655,49 @@ index 44eaef4..5d0e209 100644
              std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
          };
  
-@@ -1873,6 +1876,109 @@ namespace ps2_stubs
+@@ -1652,7 +1656,7 @@ namespace ps2_stubs
+             dispatchStreamCallbacks(rdram, ctx, runtime, events);
+         }
+ 
+-        void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
++        void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height, size_t maxBytes = SIZE_MAX)
+         {
+             if (!rdram || destAddr == 0u)
+             {
+@@ -1668,6 +1672,10 @@ namespace ps2_stubs
+                     static_cast<size_t>(mbx) * static_cast<size_t>(outHeight) * 16u * 4u;
+                 for (uint32_t y = 0u; y < outHeight; ++y)
+                 {
++                    if (stripOffset + static_cast<size_t>(y) * 16u * 4u + 64u > maxBytes)
++                    {
++                        return;
++                    }
+                     uint8_t *dst = getMemPtr(
+                         rdram,
+                         destAddr + static_cast<uint32_t>(stripOffset + static_cast<size_t>(y) * 16u * 4u));
+@@ -1686,7 +1694,9 @@ namespace ps2_stubs
+             }
+         }
+ 
+-        void writeDecodedFrameToGuest(uint8_t *rdram, uint32_t destAddr, const MpegDecodedFrame &frame)
++        // maxBytes: the guest buffer size (sceMpegGetPicture's macroblock count x 1 KB). Writing past it
++        // overwrote whatever followed the buffer (e.g. the game's display environment -> black screen).
++        void writeDecodedFrameToGuest(uint8_t *rdram, uint32_t destAddr, const MpegDecodedFrame &frame, size_t maxBytes = SIZE_MAX)
+         {
+             if (!rdram || destAddr == 0u || frame.rgba.empty() || frame.width <= 0 || frame.height <= 0)
+             {
+@@ -1705,6 +1715,10 @@ namespace ps2_stubs
+                     static_cast<size_t>(mbx) * static_cast<size_t>(outHeight) * 16u * 4u;
+                 for (uint32_t y = 0u; y < outHeight; ++y)
+                 {
++                    if (stripOffset + static_cast<size_t>(y) * 16u * 4u + 64u > maxBytes)
++                    {
++                        return;
++                    }
+                     uint8_t *dst = getMemPtr(
+                         rdram,
+                         destAddr + static_cast<uint32_t>(stripOffset + static_cast<size_t>(y) * 16u * 4u));
+@@ -1873,6 +1887,109 @@ namespace ps2_stubs
          setReturnS32(ctx, 0);
      }
  
@@ -1622,7 +1807,7 @@ index 44eaef4..5d0e209 100644
      void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
          const uint32_t mpegAddr = getRegU32(ctx, 4);
-@@ -2307,6 +2413,68 @@ namespace ps2_stubs
+@@ -2307,6 +2424,68 @@ namespace ps2_stubs
                      });
                      ++g_mpeg_stub_state.getPictureWaitTraceCount;
                  }
@@ -1691,6 +1876,39 @@ index 44eaef4..5d0e209 100644
                  lock.unlock();
                  runtime->eeScheduler().waitExternal(
                      EeWaitReason::Mpeg,
+@@ -2406,13 +2585,30 @@ namespace ps2_stubs
+             }
+         }
+ 
++        // Third argument: macroblock count the guest buffer holds (16x16 RGBA32 = 1 KB each).
++        const uint32_t mbCount = getRegU32(ctx, 6);
++        const size_t maxBytes = (mbCount != 0u && mbCount < 0x10000u) ? static_cast<size_t>(mbCount) * 1024u : SIZE_MAX;
++        {
++            static uint32_t s_getPictureArgLogs = 0u;
++            const size_t frameBytes = static_cast<size_t>(align16(width)) * align16(height) * 4u;
++            if (s_getPictureArgLogs < 24u)
++            {
++                ++s_getPictureArgLogs;
++                PS2_IF_AGRESSIVE_LOGS({
++                    std::cerr << "[MPEG:GetPicture:args] mpeg=0x" << std::hex << mpegAddr << " image=0x" << imageAddr
++                              << std::dec << " mbCount=" << mbCount << " frame=" << width << "x" << height
++                              << " frameBytes=" << frameBytes << " clamped=" << (frameBytes > maxBytes ? 1 : 0)
++                              << std::endl;
++                });
++            }
++        }
+         if (haveFrame)
+         {
+-            writeDecodedFrameToGuest(rdram, imageAddr, frame);
++            writeDecodedFrameToGuest(rdram, imageAddr, frame, maxBytes);
+         }
+         else if (frameCount == 0u)
+         {
+-            writeBlankMpegFrame(rdram, imageAddr, width, height);
++            writeBlankMpegFrame(rdram, imageAddr, width, height, maxBytes);
+         }
+ 
+         setReturnS32(ctx, 0);
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
 index bbf7edf..8f3f5a5 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
@@ -1999,6 +2217,100 @@ index 0000000..a4d2ceb
 +}
 +
 +PS2_REGISTER_GAME_OVERRIDE("Shadow Hearts: Covenant (USA)", "SLUS_210.41", 0x00200008u, 0u, &shc_usa::apply)
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..d29be08 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -8,6 +8,7 @@
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <algorithm>
++#include <cstdlib>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
+@@ -1848,13 +1849,20 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+     // Snapshot local memory under the backend lock, then perform the expensive
+     // display conversion without holding the producer-side raster lock.
+     thread_local std::vector<uint8_t> snapshot;
+-    SnapshotVram(snapshot);
+-    if (snapshot.empty())
+-        return {};
++    GSPresentationRequest consistent = request;
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (!m_vram || m_vramSize == 0u)
++            return {};
++        if (consistent.refreshUnderLock)
++            consistent.refreshUnderLock(consistent.refreshUser, consistent);
++        snapshot.resize(m_vramSize);
++        std::memcpy(snapshot.data(), m_vram, m_vramSize);
++    }
+ 
+     thread_local GSCpuBackend snapshotBackend;
+     snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
+-    return snapshotBackend.PresentFromLocalMemory(request);
++    return snapshotBackend.PresentFromLocalMemory(consistent);
+ }
+ 
+ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
+@@ -1899,7 +1907,16 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+         if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
+             return false;
+ 
+-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
++        // Upstream heuristic: when the displayed buffer is entirely black, show another context's
++        // frame instead. On a PS2 a black frame is simply black; during fades this showed the
++        // half-drawn back buffer and made the screen flicker (Shadow Hearts boot -> MIDWAY logo).
++        // Off by default; PS2X_BLACK_FALLBACK=1 restores it.
++        static const bool blackFallback = []
++        {
++            const char *v = std::getenv("PS2X_BLACK_FALLBACK");
++            return v != nullptr && v[0] == '1';
++        }();
++        if (blackFallback && !usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
+         {
+             for (const GSFrameReg &candidate : request.contextFrames)
+             {
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f..5a638ec 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
+@@ -539,6 +540,29 @@ void GS::latchHostPresentationFrame()
+         }
+         request = buildPresentationRequestUnlocked();
+     }
++    {
++        // PS2X_PRESENT_LOCKED=0 restores the old (racy) behaviour for comparison.
++        static const bool lockedPresent = []
++        {
++            const char *v = std::getenv("PS2X_PRESENT_LOCKED");
++            return !(v && v[0] == '0');
++        }();
++        if (lockedPresent)
++        {
++            request.refreshUser = m_privRegs;
++            request.refreshUnderLock = [](void *user, GSPresentationRequest &r)
++            {
++                const auto *regs = static_cast<const GSRegisters *>(user);
++                r.pmode = regs->pmode;
++                r.smode2 = regs->smode2;
++                r.dispfb1 = regs->dispfb1;
++                r.display1 = regs->display1;
++                r.dispfb2 = regs->dispfb2;
++                r.display2 = regs->display2;
++                r.bgcolor = regs->bgcolor;
++            };
++        }
++    }
+ 
+     PresentationFrame frame{};
+     {
 diff --git a/ps2xRuntime/src/lib/ps2_iop_transport.h b/ps2xRuntime/src/lib/ps2_iop_transport.h
 index 6bd1835..a149992 100644
 --- a/ps2xRuntime/src/lib/ps2_iop_transport.h
@@ -2035,7 +2347,7 @@ index 6bd1835..a149992 100644
      {
          return !runtime || runtime->canBindIopRpc(sid);
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 37b6a4d..32b3f6f 100644
+index 37b6a4d..cc4f59d 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
 @@ -8,6 +8,42 @@
@@ -2092,7 +2404,36 @@ index 37b6a4d..32b3f6f 100644
  }
  
  uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
-@@ -1947,6 +1987,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+@@ -1344,7 +1384,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // Real DMA has no tag limit; this only guards against a looping chain. 4096 was too
++                    // low: Shadow Hearts' field packets use ~4100 tags per frame and the tail (room
++                    // objects, the final STCYCL 1/1) was silently dropped, so objects blinked.
++                    const int kMaxChainTags = 1 << 20;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1521,6 +1564,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                     }
+ 
++                    if (tagsProcessed >= kMaxChainTags)
++                    {
++                        static uint32_t limitLogs = 0u;
++                        if (limitLogs < 20u)
++                        {
++                            ++limitLogs;
++                            std::fprintf(stderr, "[dma:chain-limit] channel=%08x stopped after %d tags at tag=%08x\n",
++                                         channelBase, tagsProcessed, tagAddr);
++                        }
++                    }
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+@@ -1947,6 +2000,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
  {
      if (!data || sizeBytes < 16)
          return;
@@ -2100,7 +2441,7 @@ index 37b6a4d..32b3f6f 100644
  
      if (pathId == GifPathId::Path3)
      {
-@@ -2247,6 +2288,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
+@@ -2247,6 +2301,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
      const uint8_t *payload = nullptr;
      if (!resolveContiguous(tadr + 16u, payloadBytes, payload))
          return false;
@@ -2109,7 +2450,7 @@ index 37b6a4d..32b3f6f 100644
          return false;
  
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..36a00a3 100644
+index 45cb9d2..22d0a0a 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,4 @@
@@ -2125,18 +2466,42 @@ index 45cb9d2..36a00a3 100644
  #include <limits>
  #include <chrono>
  #include <atomic>
-@@ -27,6 +29,10 @@
+@@ -27,6 +29,34 @@
  #include <unordered_map>
  #include <sstream>
  
 +namespace ps2x_prof { void start(void *gameThreadNativeHandle); }
-+namespace ps2x_watch { void arm(uint8_t *rdram); }
++// Number of EE safe-point suspensions taken so far (generated code returns to the scheduler
++// after each one). dispatchGuestBranch uses it to tell "callee finished" from "callee paused".
++static thread_local uint64_t g_eeSuspendCount = 0u;
++
++// F9 snapshots are numbered: PS2X_GSDUMP=C:\x\gs.bin -> gs_1.bin, gs_2.bin, ... (plus .txt/.vu1/.ram/.gif).
++static uint32_t g_gsDumpIndex = 0u;
++// Function-entry hook declared in ps2_log.h (null unless a diagnostic installs one). It lets
++// per-function diagnostics change without recompiling the generated game code.
++namespace ps2_log
++{
++    void (*g_ps2xFnEntryHook)(const char *name) = nullptr;
++}
++static std::string ps2xGsDumpName(const char *base)
++{
++    std::string path(base);
++    const size_t slash = path.find_last_of("/\\");
++    const size_t dot = path.find_last_of('.');
++    const std::string suffix = "_" + std::to_string(g_gsDumpIndex == 0u ? 1u : g_gsDumpIndex);
++    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
++        path.insert(dot, suffix);
++    else
++        path += suffix;
++    return path;
++}
++namespace ps2x_watch { void arm(uint8_t *rdram, uint8_t *vram); }
 +void ps2x_gifCaptureStart(const char *path, uint32_t packets);
 +
  namespace ps2_stubs
  {
      void resetSifState();
-@@ -1065,6 +1071,14 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+@@ -1065,6 +1095,14 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
          paths.mcRoot = paths.elfDirectory / "mc0";
      }
  
@@ -2151,7 +2516,7 @@ index 45cb9d2..36a00a3 100644
      setIoPaths(paths);
  }
  
-@@ -1109,10 +1123,94 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
+@@ -1109,10 +1147,94 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
      return replaceFunction(address, func);
  }
  
@@ -2247,7 +2612,7 @@ index 45cb9d2..36a00a3 100644
  }
  
  const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
-@@ -1147,6 +1245,10 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+@@ -1147,6 +1269,10 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
              return fn;
          }
      }
@@ -2258,17 +2623,64 @@ index 45cb9d2..36a00a3 100644
  
      std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
                << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
-@@ -2364,6 +2466,9 @@ void PS2Runtime::run()
+@@ -1358,6 +1484,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // this charge bounds straight-line call chains that have no local loop.
+     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+     {
++        ++g_eeSuspendCount;
+         return false;
+     }
+ 
+@@ -1396,6 +1523,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    const uint64_t suspendsBefore = g_eeSuspendCount;
+     targetFn(rdram, ctx, this);
+ 
+     if (isStopRequested() || ctx->pc == 0u)
+@@ -1403,7 +1531,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    if (ctx->pc == entryPc)
++    // A stub returns with pc still at its entry: that means "done". But a callee that was
++    // paused at a safe point can also be left at its entry (a recursive call to itself).
++    // Treating that as "done" resumed the caller with the callee's stack frame still in place,
++    // and the caller later reloaded ra from the wrong slot (jumps into heap data).
++    if (ctx->pc == entryPc && g_eeSuspendCount == suspendsBefore)
+     {
+         ctx->pc = fallthroughPc;
+     }
+@@ -2211,7 +2343,12 @@ void PS2Runtime::postEeEvent(EeEvent event)
+ 
+ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+ {
+-    return m_eeScheduler->checkpointDue(cycles);
++    const bool due = m_eeScheduler->checkpointDue(cycles);
++    if (due)
++    {
++        ++g_eeSuspendCount;
++    }
++    return due;
+ }
+ 
+ [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
+@@ -2364,6 +2501,13 @@ void PS2Runtime::run()
  
      std::atomic<bool> gameThreadFinished{false};
  
 +    // Opt-in host memory watchpoint on guest RAM (PS2X_WATCH=<phys hex>,<len hex>); no-op otherwise.
-+    ps2x_watch::arm(m_memory.getRDRAM());
++    // PS2X_WATCH_ON_F10=1 defers arming until F10 is pressed (watching stack memory from boot is too slow).
++    if (!std::getenv("PS2X_WATCH_ON_F10"))
++    {
++        ps2x_watch::arm(m_memory.getRDRAM(), m_memory.getGSVRAM());
++    }
 +
      std::thread gameThread([&]()
                             {
          ThreadNaming::SetCurrentThreadName("GameThread");
-@@ -2385,9 +2490,28 @@ void PS2Runtime::run()
+@@ -2385,9 +2529,33 @@ void PS2Runtime::run()
          }
          gameThreadFinished.store(true, std::memory_order_release); });
  
@@ -2285,19 +2697,24 @@ index 45cb9d2..36a00a3 100644
 +    bool gsDumpRequested = false; // F9 requests a PS2X_GSDUMP snapshot
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
++        if (IsKeyPressed(KEY_F10))
++        {
++            ps2x_watch::arm(m_memory.getRDRAM(), m_memory.getGSVRAM());
++        }
 +        if (IsKeyPressed(KEY_F9))
 +        {
 +            gsDumpRequested = true;
 +            if (const char *gsPath = std::getenv("PS2X_GSDUMP"))
 +            {
++                ++g_gsDumpIndex;
 +                // Also capture the next 3000 raw GIF packets to <file>.gif.
-+                ps2x_gifCaptureStart((std::string(gsPath) + ".gif").c_str(), 3000u);
++                ps2x_gifCaptureStart((ps2xGsDumpName(gsPath) + ".gif").c_str(), 3000u);
 +            }
 +        }
          PS2_IF_AGRESSIVE_LOGS({
              tick++;
              if ((tick % 120) == 0)
-@@ -2410,6 +2534,8 @@ void PS2Runtime::run()
+@@ -2410,6 +2578,8 @@ void PS2Runtime::run()
                                                 << " gp=0x" << dbgGp
                                                 << " dispfb1=0x" << gs.dispfb1
                                                 << " display1=0x" << gs.display1
@@ -2306,7 +2723,7 @@ index 45cb9d2..36a00a3 100644
                                                 << std::dec
                                                 << " activeThreads=" << eeSnapshot.threads.size()
                                                 << " dma=" << curDma
-@@ -2417,6 +2543,133 @@ void PS2Runtime::run()
+@@ -2417,6 +2587,134 @@ void PS2Runtime::run()
                                                 << " gsw=" << curGs
                                                 << " vif=" << curVif
                                                 << std::endl);
@@ -2345,25 +2762,26 @@ index 45cb9d2..36a00a3 100644
 +                    if (const char *gsPath = std::getenv("PS2X_GSDUMP"); gsPath && (gsDumpRequested || tick == static_cast<uint64_t>(std::atoi(std::getenv("PS2X_GSDUMPTICK") ? std::getenv("PS2X_GSDUMPTICK") : "0"))))
 +                    {
 +                        gsDumpRequested = false;
-+                        if (FILE *vf = std::fopen(gsPath, "wb"))
++                        const std::string gsName = ps2xGsDumpName(gsPath);
++                        if (FILE *vf = std::fopen(gsName.c_str(), "wb"))
 +                        {
 +                            std::fwrite(m_memory.getGSVRAM(), 1, PS2_GS_VRAM_SIZE, vf);
 +                            std::fclose(vf);
 +                        }
 +                        // Main RAM (32 MB) -> <file>.ram
-+                        if (FILE *rf = std::fopen((std::string(gsPath) + ".ram").c_str(), "wb"))
++                        if (FILE *rf = std::fopen((gsName + ".ram").c_str(), "wb"))
 +                        {
 +                            std::fwrite(m_memory.getRDRAM(), 1, 32u * 1024u * 1024u, rf);
 +                            std::fclose(rf);
 +                        }
 +                        // VU1 micro memory (16 KB) followed by VU1 data memory (16 KB) -> <file>.vu1
-+                        if (FILE *uf = std::fopen((std::string(gsPath) + ".vu1").c_str(), "wb"))
++                        if (FILE *uf = std::fopen((gsName + ".vu1").c_str(), "wb"))
 +                        {
 +                            std::fwrite(m_memory.getVU1Code(), 1, 16u * 1024u, uf);
 +                            std::fwrite(m_memory.getVU1Data(), 1, 16u * 1024u, uf);
 +                            std::fclose(uf);
 +                        }
-+                        const std::string txtPath = std::string(gsPath) + ".txt";
++                        const std::string txtPath = gsName + ".txt";
 +                        if (FILE *tf = std::fopen(txtPath.c_str(), "w"))
 +                        {
 +                            const GSRegisters &pr = m_memory.gs();
@@ -2411,7 +2829,7 @@ index 45cb9d2..36a00a3 100644
 +                            }
 +                            std::fclose(tf);
 +                        }
-+                        RUNTIME_LOG("[run:gsdump] wrote " << gsPath << std::endl);
++                        RUNTIME_LOG("[run:gsdump] wrote " << gsName << std::endl);
 +                    }
 +                    auto w = [&](uint32_t a) { uint32_t v; std::memcpy(&v, rd + (a & 0x1FFFFFFu), 4); return v; };
 +                    RUNTIME_LOG("[run:shc] fio busy=0x" << std::hex << w(0x43FC60) << " en=0x" << w(0x43FC58)
@@ -2440,3 +2858,255 @@ index 45cb9d2..36a00a3 100644
  
              }
          });
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index f872edd..537cadf 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,9 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <cstring>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
+ 
+ enum VIFCmd : uint8_t
+ {
+@@ -295,16 +298,84 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+     processVIF1Data(m_rdram + srcPhys, sizeBytes);
+ }
+ 
++// VIF commands whose payload did not fit in the previous buffer. The VIF waits mid-command
++// on real hardware; without this the rest of the payload was parsed as VIF codes (a GIF
++// packet fragment once decoded as "UNPACK S-16 x177 to row 0" and wiped the VU1 matrices).
++static std::vector<uint8_t> s_vif1Carry;
++
++// PATH2 GIF packets can be split across DIRECT commands (e.g. the GIF tag in one DIRECT, its
++// data in the next); the GIF keeps parsing across them on hardware. The GS parser here starts
++// fresh on every submission, so an unfinished PACKED/REGLIST tag is held back and resubmitted
++// with the following DIRECT payload. (IMAGE tags already stream: see m_vif1PendingPath2ImageQwc.)
++static std::vector<uint8_t> s_path2GifCarry;
++
++// Bytes of `d` made of complete GIF packets. An incomplete PACKED/REGLIST tag ends the count at
++// its own start; an incomplete IMAGE tag counts as complete (its data streams).
++static uint32_t completeGifBytes(const uint8_t *d, uint32_t n)
++{
++    uint32_t off = 0u;
++    while (off + 16u <= n)
++    {
++        uint64_t lo = 0u;
++        std::memcpy(&lo, d + off, sizeof(lo));
++        const uint64_t nloop = lo & 0x7FFFu;
++        const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
++        uint64_t nreg = (lo >> 60) & 0xFu;
++        if (nreg == 0u)
++            nreg = 16u;
++        uint64_t body = 0u;
++        if (flg == 0u)
++            body = nloop * nreg * 16u;
++        else if (flg == 1u)
++            body = ((nloop * nreg + 1u) / 2u) * 16u;
++        else
++            body = nloop * 16u;
++        if (static_cast<uint64_t>(off) + 16u + body > n)
++            return (flg >= 2u) ? n : off;
++        off += 16u + static_cast<uint32_t>(body);
++    }
++    return off;
++}
++
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u)
+         return;
+ 
++    // Bisect switches (default on): PS2X_VIF_CARRY=0 disables carrying split commands,
++    // PS2X_VIF_CARRY_DIRECT=0 disables it for DIRECT/DIRECTHL only.
++    static const bool carryEnabled = []()
++    { const char *v = std::getenv("PS2X_VIF_CARRY"); return !(v && v[0] == '0'); }();
++    static const bool carryDirect = []()
++    { const char *v = std::getenv("PS2X_VIF_CARRY_DIRECT"); return !(v && v[0] == '0'); }();
++
++    static const bool vifDiag = std::getenv("PS2X_SIFDIAG") != nullptr;
++    static uint32_t vifSplitLogs = 0u;
++    if (!s_vif1Carry.empty())
++    {
++        if (vifDiag && vifSplitLogs < 120u)
++        {
++            ++vifSplitLogs;
++            uint32_t carryCode = 0u, next[4] = {};
++            std::memcpy(&carryCode, s_vif1Carry.data(), 4);
++            std::memcpy(next, data, std::min<size_t>(sizeof(next), sizeBytes));
++            std::fprintf(stderr, "[vif1:carry-join] carried=%zu code=%08x nextBytes=%u next=%08x %08x %08x %08x\n",
++                         s_vif1Carry.size(), carryCode, sizeBytes, next[0], next[1], next[2], next[3]);
++        }
++        std::vector<uint8_t> combined;
++        combined.swap(s_vif1Carry);
++        combined.insert(combined.end(), data, data + sizeBytes);
++        processVIF1Data(combined.data(), static_cast<uint32_t>(combined.size()));
++        return;
++    }
++
+     uint32_t pos = 0;
+ 
+     while (pos + 4 <= sizeBytes)
+     {
+-        if (m_vif1PendingPath2ImageQwc != 0u)
++        // Legacy path only: with DIRECT carry on, the VIF always reads a VIF code next, and the
++        // pending image is continued from the next DIRECT's payload instead (see VIF_DIRECT).
++        if (m_vif1PendingPath2ImageQwc != 0u && !(carryEnabled && carryDirect))
+         {
+             const uint32_t availableQw = (sizeBytes - pos) / 16u;
+             if (availableQw == 0u)
+@@ -333,6 +404,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ 
+         uint32_t cmd;
+         memcpy(&cmd, data + pos, 4);
++        const uint32_t cmdStart = pos;
+         pos += 4;
+ 
+         uint8_t opcode = (cmd >> 24) & 0x7F;
+@@ -340,6 +412,49 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         uint8_t num = (cmd >> 16) & 0xFF;
+         const bool irq = (cmd & 0x80000000u) != 0u;
+ 
++        // Payload size of commands that carry data; if it is not all here yet, keep the
++        // command for the next buffer instead of skipping it.
++        {
++            uint64_t payload = 0u;
++            if (opcode == VIF_STMASK)
++                payload = 4u;
++            else if ((opcode == VIF_DIRECT || opcode == VIF_DIRECTHL) && carryDirect)
++                payload = static_cast<uint64_t>(imm == 0u ? 65536u : imm) * 16u; // whole GIF packets only
++            else if (opcode == VIF_STROW || opcode == VIF_STCOL)
++                payload = 16u;
++            else if (opcode == VIF_MPG)
++                payload = static_cast<uint64_t>(num == 0u ? 256u : num) * 8u;
++            else if ((opcode & 0x60) == 0x60)
++            {
++                const uint32_t uvn = (opcode >> 2) & 0x3u;
++                const uint32_t uvl = opcode & 0x3u;
++                const uint32_t bitsPerVector = (uvl == 3u && uvn == 3u) ? 16u : (uvn + 1u) * (32u >> uvl);
++                const uint32_t bytesPerVector = (bitsPerVector + 7u) / 8u;
++                const uint32_t writes = (num == 0u) ? 256u : num;
++                uint32_t ucl = vif1_regs.cycle & 0xFFu;
++                uint32_t uwl = (vif1_regs.cycle >> 8) & 0xFFu;
++                if (ucl == 0u)
++                    ucl = 1u;
++                if (uwl == 0u)
++                    uwl = 1u;
++                uint32_t sources = writes;
++                if (ucl < uwl)
++                    sources = (writes / uwl) * ucl + std::min(writes % uwl, ucl);
++                payload = (static_cast<uint64_t>(sources) * bytesPerVector + 3u) & ~3ull;
++            }
++            if (carryEnabled && payload != 0u && static_cast<uint64_t>(pos) + payload > sizeBytes)
++            {
++                if (vifDiag && vifSplitLogs < 120u)
++                {
++                    ++vifSplitLogs;
++                    std::fprintf(stderr, "[vif1:carry] code=%08x need=%llu have=%u bufBytes=%u\n", cmd,
++                                 static_cast<unsigned long long>(payload), sizeBytes - pos, sizeBytes);
++                }
++                s_vif1Carry.assign(data + cmdStart, data + sizeBytes);
++                return;
++            }
++        }
++
+         // Track most-recent command for VIFn_CODE emulation.
+         vif1_regs.code = cmd;
+         vif1_regs.num = num;
+@@ -492,19 +607,87 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 qwCount = 65536;
+             const uint32_t availableQw = (sizeBytes - pos) / 16u;
+             const bool truncated = qwCount > availableQw;
++            if (truncated && vifDiag && vifSplitLogs < 120u)
++            {
++                ++vifSplitLogs;
++                std::fprintf(stderr, "[vif1:direct-truncated] code=%08x needQw=%u haveQw=%u bufBytes=%u\n", cmd,
++                             qwCount, availableQw, sizeBytes);
++            }
+             if (qwCount > availableQw)
+                 qwCount = availableQw;
+ 
+             if (qwCount > 0)
+             {
+                 const bool directHl = (opcode == VIF_DIRECTHL);
+-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+-
+-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+-                if (pendingImageQw != 0u)
++                uint32_t packetOffset = 0u;
++                if (carryEnabled && carryDirect && m_vif1PendingPath2ImageQwc != 0u)
++                {
++                    // The GIF is still inside an IMAGE transfer started by an earlier DIRECT:
++                    // the first qwords of this payload are the rest of that image.
++                    const uint32_t imageQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qwCount);
++                    std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(imageQw) * 16u, 0u);
++                    const uint64_t imageTag =
++                        static_cast<uint64_t>(imageQw & 0x7FFFu) |
++                        ((m_vif1PendingPath2ImageQwc == imageQw) ? (1ull << 15) : 0ull) |
++                        (static_cast<uint64_t>(kGifFmtImage) << 58);
++                    std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
++                    std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(imageQw) * 16u);
++                    submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true,
++                                    m_vif1PendingPath2DirectHl);
++                    m_vif1PendingPath2ImageQwc -= imageQw;
++                    if (m_vif1PendingPath2ImageQwc == 0u)
++                        m_vif1PendingPath2DirectHl = false;
++                    packetOffset = imageQw * 16u;
++                }
++                const uint32_t restBytes = qwCount * 16u - packetOffset;
++                static const bool gifCarry = []()
++                { const char *v = std::getenv("PS2X_GIF_CARRY"); return !(v && v[0] == '0'); }();
++                if (restBytes > 0u && gifCarry && carryEnabled && carryDirect)
++                {
++                    std::vector<uint8_t> joined;
++                    const uint8_t *submit = data + pos + packetOffset;
++                    uint32_t submitBytes = restBytes;
++                    if (!s_path2GifCarry.empty())
++                    {
++                        joined.swap(s_path2GifCarry);
++                        joined.insert(joined.end(), submit, submit + restBytes);
++                        submit = joined.data();
++                        submitBytes = static_cast<uint32_t>(joined.size());
++                    }
++                    const uint32_t complete = completeGifBytes(submit, submitBytes);
++                    if (complete < submitBytes)
++                    {
++                        static uint32_t gifCarryLogs = 0u;
++                        if (vifDiag && gifCarryLogs < 60u)
++                        {
++                            ++gifCarryLogs;
++                            std::fprintf(stderr, "[vif1:gif-carry] holding %u bytes of an unfinished PATH2 GIF tag\n",
++                                         submitBytes - complete);
++                        }
++                        std::vector<uint8_t> rest(submit + complete, submit + submitBytes);
++                        s_path2GifCarry.swap(rest);
++                    }
++                    if (complete > 0u)
++                    {
++                        submitGifPacket(GifPathId::Path2, submit, complete, true, directHl);
++                        const uint32_t pendingImageQw = pendingGifImageQwc(submit, complete);
++                        if (pendingImageQw != 0u)
++                        {
++                            m_vif1PendingPath2ImageQwc = pendingImageQw;
++                            m_vif1PendingPath2DirectHl = directHl;
++                        }
++                    }
++                }
++                else if (restBytes > 0u)
+                 {
+-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
+-                    m_vif1PendingPath2DirectHl = directHl;
++                    submitGifPacket(GifPathId::Path2, data + pos + packetOffset, restBytes, true, directHl);
++
++                    const uint32_t pendingImageQw = pendingGifImageQwc(data + pos + packetOffset, restBytes);
++                    if (pendingImageQw != 0u)
++                    {
++                        m_vif1PendingPath2ImageQwc = pendingImageQw;
++                        m_vif1PendingPath2DirectHl = directHl;
++                    }
+                 }
+             }
+ 

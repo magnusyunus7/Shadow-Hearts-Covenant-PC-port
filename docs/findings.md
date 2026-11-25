@@ -81,6 +81,14 @@ get merged unless listed as entry points (`addctors.py`).
   macro instructions. Bone matrices are built by `0x240E80`, starting from an identity matrix made
   from `vf0` with `VMR32`. **VU0 `vf0` must read (0, 0, 0, 1) on every thread**; with zero the whole
   chain is zero and nothing is drawn.
+* A field frame is one VIF1 DMA chain of about **4,100 tags** (packet built in a double buffer at
+  `0xE0xxxx`/`0xE1xxxx`, model data at `0xCAxxxx`–`0xCDxxxx`). Each object sets `STCYCL 3/1` for its
+  geometry and `STCYCL 1/1` again at the end; matrix uploads rely on that.
+* The field VU1 microprogram starts at `0x1E8`. It writes an ADC (no-draw) flag per vertex from the
+  CLIP results and runs a second pass (from instruction 244, entered by `MSCNT`) that clips the
+  flagged triangles. Per-object parameters live in VU1 row 31.
+* The game splits PATH2 GIF packets across `DIRECT` commands: a GIF tag can arrive in one `DIRECT`
+  and its data in the next. The fade overlay is a `REGLIST` sprite (`PRIM`, `RGBAQ`, `XYZF2` ×2).
 
 ## Movies
 

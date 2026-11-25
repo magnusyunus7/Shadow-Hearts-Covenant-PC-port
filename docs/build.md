@@ -103,5 +103,20 @@ F1 toggles the debug panel.
 | `PS2X_GSDUMP=<file>` | F9 writes GS VRAM, GS registers and recent GS events (`.txt`), VU1 code+data (`.vu1`), EE RAM (`.ram`) and the next 3000 GIF packets (`.gif`) |
 | `PS2X_WATCH=<addr>,<len>` | Windows: logs every host write to that guest RAM range with the writing function and its callers (`PS2X_WATCH_LOG=<file>`) |
 | `PS2X_DUMPRAM=<file>`, `PS2X_DUMPTICK=<n>` | writes the 32 MB EE RAM at tick n (a multiple of 120) |
+| `PS2X_WATCH_VRAM=1` | with `PS2X_WATCH`: watch GS VRAM instead of guest RAM |
+| `PS2X_WATCH_ON_F10=1` | arm the watchpoint with F10 instead of at start-up |
+
+Snapshots are numbered: each F9 writes `gs_1.bin`, `gs_2.bin`, … next to the name given in
+`PS2X_GSDUMP`.
+
+Switches for comparing against the old behaviour (all fixes are on by default):
+
+| Variable | Effect |
+|---|---|
+| `PS2X_VIF_CARRY=0` | do not carry VIF commands split across DMA transfers |
+| `PS2X_VIF_CARRY_DIRECT=0` | same, for `DIRECT`/`DIRECTHL` only |
+| `PS2X_GIF_CARRY=0` | do not join PATH2 GIF tags split across `DIRECT` commands |
+| `PS2X_PRESENT_LOCKED=0` | presenter reads display registers and VRAM separately (racy) |
+| `PS2X_BLACK_FALLBACK=1` | upstream heuristic: show the back buffer when the displayed one is all black |
 
 Dumps and captures contain game data: never commit them.

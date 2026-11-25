@@ -61,10 +61,43 @@ Also verified:
 * Rejected hypothesis: Windows timer granularity. Timed scheduler waits were not the bottleneck
   (the trace log was); the experiment was removed.
 
+## Milestone 3: title menu and the first story cutscene (2026-11-25)
+
+The title screen and its menu draw correctly, New Game reaches the first story cutscene, and its
+room renders completely and stays on screen. Fixes, in the order they were found:
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| 21 | movie pixels written over the second display buffer | `sceMpegGetPicture` wrote a whole frame regardless of the buffer size the game passed | write at most `mbCount` × 1024 bytes (`MPEG.cpp`) |
+| 22 | jumps into the heap (`0x75F418`, `0x989730`) | a recursive function paused at its own self-call by a scheduler checkpoint was treated as finished, so the caller skipped ahead | only treat the call as finished if no checkpoint fired inside it (`ps2_runtime.cpp`) |
+| 23 | 3D black again in some scenes | `vf0` was only fixed for new threads; interrupt handlers and other invocations still saw zero | `vf0` = (0, 0, 0, 1) before every dispatch (`EeScheduler.cpp`) |
+| 24 | VU1 matrices overwritten | an `UNPACK` split across two DMA transfers was dropped and the rest of its data parsed as VIF codes | carry an incomplete VIF command into the next transfer (`ps2_vif1_interpreter.cpp`) |
+| 25 | title menu missing, speckled textures | a GIF IMAGE transfer continued in the next `DIRECT` was resynchronised from raw VIF words | continue the image inside the next `DIRECT` payload |
+| 26 | cutscene room blinking on and off; her hands missing | the DMA chain walker stopped after **4096 tags**; this room sends about 4100 per frame, so the tail (room objects and the final `STCYCL 1/1`) was dropped, which also scrambled the next frame's matrices | no practical limit (2^20, only a loop guard) (`ps2_memory.cpp`) |
+| 27 | black diagonal over half the screen; broken subtitles | the game splits a GIF tag and its data across two `DIRECT` commands; the GS parser started afresh on each, so the fade sprite turned into a giant triangle | hold an unfinished PATH2 tag and join it with the next `DIRECT` |
+| 28 | flicker on the black screen before the MIDWAY logo | upstream presenter showed the back buffer whenever the displayed one was all black | heuristic off by default (`PS2X_BLACK_FALLBACK=1` restores it) |
+
+How fix 26 was found (each step from logs or snapshots):
+
+1. Per-frame triangle counts: about 1,320 (character only) most of the time, about 2,200 for
+   bursts of 10 frames every ~2 s.
+2. Same VU1 program, same number of calls, same per-object parameter blocks, nearly the same VIF1
+   byte count on good and bad frames: the game sent the room every frame.
+3. A check for unexpected writes to the matrix rows found `UNPACK`s running with `CYCLE = 0103`
+   (skipping write) where the game had set `0101`: the command resetting it had never arrived.
+4. The per-frame DMA log stopped at exactly 4,101 segments: the 4,096-tag cap.
+
+Also changed: the presenter reads the display registers and copies VRAM under the same lock, so a
+flip cannot land between the two (`PS2X_PRESENT_LOCKED=0` for the old behaviour).
+
+Rejected hypotheses (tested and reverted): the game drawing into the displayed buffer (swaps were
+always correct), per-thread VU0 registers (sharing them changed nothing), the 65,536-cycle VU1
+budget (never reached).
+
 ## Next
 
+* The seated character in the first cutscene still blinks, and her hair looks wrong on close-ups.
+* Sound: the driver runs, but nothing is heard.
+* 5–10 s at the title screen before input responds.
 * Opening/story movies: frames decode but are not displayed.
-* Title screen colours (white/yellow backgrounds, texture fragments).
-* Check the 3D scene against real hardware (it looks dark), then walk around the first area.
-* Controller test on the playtester's machine; audio output from SDRV.
 * Performance: huge functions compiled `/Od`, unresolved jump tables.

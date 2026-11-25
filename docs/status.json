@@ -1,10 +1,10 @@
 {
-  "updated": "2026-11-24",
+  "updated": "2026-11-25",
   "milestones": [
     {"name": "Boots (disclaimer + title logo)", "state": "done"},
     {"name": "Opening movie", "state": "partial", "note": "decodes and is skippable; picture not shown yet"},
     {"name": "Title screen + New Game", "state": "done"},
-    {"name": "First in-engine 3D scene", "state": "done", "note": "renders; dark, not yet compared with real hardware"},
+    {"name": "First in-engine 3D scene", "state": "done", "note": "first story cutscene renders; one character still blinks"},
     {"name": "Walk around the first area", "state": "todo"},
     {"name": "First battle", "state": "todo"},
     {"name": "Save and load (memory card)", "state": "todo"},
@@ -13,7 +13,7 @@
   ],
   "systems": [
     {"name": "Game code (recompiled)", "state": "done", "note": "main + 3 overlays + ZMAIN bank"},
-    {"name": "Graphics (GS / VU1)", "state": "partial", "note": "3D renders; title colours wrong"},
+    {"name": "Graphics (GS / VU1)", "state": "partial", "note": "title menu and first cutscene room correct; character model issues"},
     {"name": "Movies (MPEG)", "state": "partial", "note": "decoding works, display does not"},
     {"name": "Input", "state": "partial", "note": "keyboard verified; controller mapped, untested"},
     {"name": "Sound", "state": "todo", "note": "driver runs; output not verified"},
