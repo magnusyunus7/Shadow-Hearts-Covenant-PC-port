@@ -94,10 +94,33 @@ Rejected hypotheses (tested and reverted): the game drawing into the displayed b
 always correct), per-thread VU0 registers (sharing them changed nothing), the 65,536-cycle VU1
 budget (never reached).
 
+## Milestone 4: character animation in the first room (2026-11-27)
+
+The Windows Release playtest reached the end of the room cutscene and continued after
+skipping the following scene. The playtester reported better character models and
+movement and did not notice the previous character flicker. Hair motion still looks wrong.
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| 29 | Characters collapse or flicker in the first room | The packed animation decoder uses EE `PREVH`. The recompiler reversed all eight halfwords, which let stale upper-register data replace the packed footer. | Reverse the four halfwords in each 64-bit half independently in `mmi_translation_helpers.cpp`. |
+
+A saved RAM capture showed a local bone translation near `(-24.64, -128.04, -228.38)` in a
+bad sample. After the fix the watched samples stayed near the expected pose, around
+`(-0.9, -3.8, -6.4)`, apart from explicit identity writes. The Release runner and
+recompiler built successfully. A fresh recompile emitted the corrected instruction,
+and an offline check passed 1,000 lane patterns plus a packed animation sample.
+
+Before the animation fix, performance profiles measured about 5 frame uploads per second
+in the heaviest room stretch and about 13 in lighter sections. VU1 dominated the slow
+stretches. The source patch includes the VU1 scheduling and arithmetic optimizations used
+in those runs.
+
 ## Next
 
-* The seated character in the first cutscene still blinks, and her hair looks wrong on close-ups.
-* Sound: the driver runs, but nothing is heard.
-* 5–10 s at the title screen before input responds.
-* Opening/story movies: frames decode but are not displayed.
-* Performance: huge functions compiled `/Od`, unresolved jump tables.
+* Investigate the remaining hair deformation and motion.
+* The scene after the room appears frozen after the narrator says “1915.” Skipping it
+  allows the game to continue. Capture the affected frame and its GIF commands.
+* Check the delay before the title screen accepts input and verify opening movie playback.
+* Verify audio beyond the narration, controller input, and memory-card use.
+* Improve performance in the heaviest scenes and address remaining oversized generated
+  functions and unresolved jump tables.

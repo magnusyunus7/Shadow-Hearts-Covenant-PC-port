@@ -54,6 +54,7 @@ entry_points = [
   "ovl_entry_00633530@0x00633530",
   "ovl_entry_006335F0@0x006335F0",
   "ovl_entry_00633620@0x00633620",
+  "ovl_entry_006E7C80@0x006E7C80",
   "ovl_entry_006E7F00@0x006E7F00",
   "ovl_entry_006E8250@0x006E8250",
   "sceCccSetTable@0x005CF620",

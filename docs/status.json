@@ -1,10 +1,11 @@
 {
-  "updated": "2026-11-25",
+  "updated": "2026-11-27",
   "milestones": [
     {"name": "Boots (disclaimer + title logo)", "state": "done"},
     {"name": "Opening movie", "state": "partial", "note": "decodes and is skippable; picture not shown yet"},
     {"name": "Title screen + New Game", "state": "done"},
-    {"name": "First in-engine 3D scene", "state": "done", "note": "first story cutscene renders; one character still blinks"},
+    {"name": "First in-engine 3D scene", "state": "done", "note": "room plays through with improved character animation"},
+    {"name": "Post-room story scene", "state": "partial", "note": "freezes after narration begins, can skip and continue"},
     {"name": "Walk around the first area", "state": "todo"},
     {"name": "First battle", "state": "todo"},
     {"name": "Save and load (memory card)", "state": "todo"},
@@ -13,11 +14,11 @@
   ],
   "systems": [
     {"name": "Game code (recompiled)", "state": "done", "note": "main + 3 overlays + ZMAIN bank"},
-    {"name": "Graphics (GS / VU1)", "state": "partial", "note": "title menu and first cutscene room correct; character model issues"},
-    {"name": "Movies (MPEG)", "state": "partial", "note": "decoding works, display does not"},
+    {"name": "Graphics (GS / VU1)", "state": "partial", "note": "room characters move properly, hair still needs work"},
+    {"name": "Movies (MPEG)", "state": "partial", "note": "opening decode works, post-room display needs investigation"},
     {"name": "Input", "state": "partial", "note": "keyboard verified; controller mapped, untested"},
-    {"name": "Sound", "state": "todo", "note": "driver runs; output not verified"},
-    {"name": "Speed", "state": "partial", "note": "Release build ~15-20 fps"},
+    {"name": "Sound", "state": "partial", "note": "narration audible, full audio still unverified"},
+    {"name": "Speed", "state": "partial", "note": "room measurements about 5 to 13 uploads per second"},
     {"name": "Memory card", "state": "todo"}
   ]
 }
