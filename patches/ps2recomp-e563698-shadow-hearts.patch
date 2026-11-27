@@ -6012,7 +6012,7 @@ index f872edd15678f8899b6dbc60db8f9d95379829ce..de420af414742fc81c8684a09281daf3
              }
  
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed02750e83 100644
+index f19e281f18c51e5e328b265ac10996e5391122cc..b86ba14e7a4f80acc415146159969139b8d74b38 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -5,6 +5,7 @@
@@ -6023,7 +6023,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
  #include <cfenv>
  #include <cmath>
  #include <cstdio>
-@@ -12,14 +13,211 @@
+@@ -12,14 +13,272 @@
  #include <cstring>
  #include <filesystem>
  #include <limits>
@@ -6033,6 +6033,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +// Per-frame statistics (PS2X_FRAMESTATS / PS2X_AUTODUMP, see Stubs/GS.cpp): XGKICKs.
 +uint32_t g_ps2xStatXgkicks = 0u;
 +extern uint32_t g_ps2xFrameNo;
++extern uint32_t g_ps2xStatVu1Runs;
 +
  namespace
  {
@@ -6082,9 +6083,21 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +        return false;
 +    }
 +
-+    struct Vu1CollapseCapture
++    constexpr uint32_t kVu1SampleLimit = 96u;
++    constexpr uint32_t kVu1SampleStride = 37u;
++
++    bool vu1CaptureEnabled()
 +    {
-+        const char *path = std::getenv("PS2X_VU1_COLLAPSE_DUMP");
++        static const bool enabled = std::getenv("PS2X_VU1_COLLAPSE_DUMP") != nullptr ||
++                                    std::getenv("PS2X_VU1_SAMPLE_DUMP") != nullptr;
++        return enabled;
++    }
++
++    struct Vu1Capture
++    {
++        const char *samplePath = std::getenv("PS2X_VU1_SAMPLE_DUMP");
++        bool sample = samplePath && samplePath[0] != '\0';
++        const char *path = sample ? samplePath : std::getenv("PS2X_VU1_COLLAPSE_DUMP");
 +        std::array<uint8_t, PS2_VU1_CODE_SIZE> code;
 +        std::array<uint8_t, PS2_VU1_DATA_SIZE> data;
 +        VU1State initialState{};
@@ -6092,26 +6105,56 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +        uint32_t dataBytes = 0u;
 +        uint32_t lastFrame = 0u;
 +        uint32_t written = 0u;
++        uint32_t observedFrame = 0u;
++        uint32_t observedRuns = 0u;
++        uint32_t busyFrames = 0u;
 +        bool armed = false;
++        bool starting = false;
 +    };
 +
-+    Vu1CollapseCapture &collapseCapture()
++    Vu1Capture &vu1Capture()
 +    {
-+        static thread_local Vu1CollapseCapture capture;
++        static thread_local Vu1Capture capture;
 +        return capture;
 +    }
 +
-+    void captureCollapsedKick(const uint8_t *packet, uint32_t bytes, uint32_t source,
++    bool sampleVu1Program(Vu1Capture &capture)
++    {
++        if (capture.written >= kVu1SampleLimit || !capture.path)
++            return false;
++
++        constexpr uint32_t kBusyRuns = 1000u;
++        constexpr uint32_t kBusyFramesNeeded = 3u;
++        const uint32_t frame = g_ps2xFrameNo;
++        if (frame != capture.observedFrame)
++        {
++            // Require sustained load. An isolated burst or a flip with no
++            // VU1 work should not start the capture.
++            if (frame - capture.observedFrame == 1u && capture.observedRuns >= kBusyRuns)
++                capture.busyFrames = std::min(capture.busyFrames + 1u, kBusyFramesNeeded);
++            else
++                capture.busyFrames = 0u;
++            capture.observedFrame = frame;
++            capture.observedRuns = 0u;
++        }
++        const uint32_t runs = g_ps2xStatVu1Runs;
++        capture.observedRuns = std::max(capture.observedRuns, runs);
++        return capture.busyFrames == kBusyFramesNeeded && capture.starting &&
++               runs % kVu1SampleStride == frame % kVu1SampleStride;
++    }
++
++    void captureKick(const uint8_t *packet, uint32_t bytes, uint32_t source,
 +                              uint64_t issueCycle, const VU1State &state)
 +    {
-+        auto &capture = collapseCapture();
-+        if (!capture.armed || !hasCollapsedStrip(packet, bytes))
++        auto &capture = vu1Capture();
++        if (!capture.armed || (!capture.sample && !hasCollapsedStrip(packet, bytes)))
 +            return;
 +        capture.armed = false;
++        const char *label = capture.sample ? "sample" : "collapse";
 +        FILE *file = std::fopen(capture.path, capture.written == 0u ? "wb" : "ab");
 +        if (!file)
 +        {
-+            std::fprintf(stderr, "[vu1:collapse] could not open %s\n", capture.path);
++            std::fprintf(stderr, "[vu1:%s] could not open %s\n", label, capture.path);
 +            capture.path = nullptr;
 +            return;
 +        }
@@ -6130,15 +6173,16 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +        const bool closed = std::fclose(file) == 0;
 +        if (!ok || !closed)
 +        {
-+            std::fprintf(stderr, "[vu1:collapse] write failed for %s\n", capture.path);
++            std::fprintf(stderr, "[vu1:%s] write failed for %s\n", label, capture.path);
 +            capture.path = nullptr;
 +            return;
 +        }
 +        capture.lastFrame = g_ps2xFrameNo;
 +        ++capture.written;
-+        std::fprintf(stderr, "[vu1:collapse] capture=%u frame=%u entry=%04x top=%03x itop=%03x gif=%u\n",
-+                     capture.written, capture.lastFrame, capture.initialState.pc,
-+                     capture.initialState.top, capture.initialState.itop, bytes);
++        if (!capture.sample || capture.written == 1u || capture.written == kVu1SampleLimit)
++            std::fprintf(stderr, "[vu1:%s] capture=%u frame=%u entry=%04x top=%03x itop=%03x gif=%u\n",
++                         label, capture.written, capture.lastFrame, capture.initialState.pc,
++                         capture.initialState.top, capture.initialState.itop, bytes);
 +    }
 +
      constexpr uint8_t laneForComponent(uint32_t component)
@@ -6163,7 +6207,8 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +    };
 +    constexpr size_t kCommitGateSlots = 4;
 +    CommitGate g_commitGates[kCommitGateSlots];
-+    CommitGate g_commitGateOverflow;
++    CommitGate g_commitGateOverflow{.useFullScan = true};
++    thread_local CommitGate *t_runningGate = nullptr;
 +
 +    bool commitGateEnabled()
 +    {
@@ -6213,11 +6258,27 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +        return gate;
 +    }
 +
-+    inline void lowerCommitGate(const void *self, uint64_t cycle, uint64_t readyCycle,
-+                                PipeKind kind, size_t slot)
++    class ScopedCommitGate
 +    {
-+        CommitGate &gate = commitGateFor(self);
-+        if (&gate == &g_commitGateOverflow || gate.useFullScan)
++    public:
++        explicit ScopedCommitGate(const void *self) : previous(t_runningGate)
++        {
++            t_runningGate = &commitGateFor(self);
++        }
++
++        ~ScopedCommitGate()
++        {
++            t_runningGate = previous;
++        }
++
++    private:
++        CommitGate *previous;
++    };
++
++    inline void lowerCommitGate(uint64_t cycle, uint64_t readyCycle, PipeKind kind, size_t slot)
++    {
++        CommitGate &gate = *t_runningGate;
++        if (gate.useFullScan)
 +            return;
 +        // Fall back to the queue scan if a future instruction needs a longer
 +        // latency than the wheel can unambiguously represent.
@@ -6235,7 +6296,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
  }
  
  void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
-@@ -66,6 +264,16 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+@@ -66,6 +325,16 @@ VU1Interpreter::VU1Interpreter(Unit unit)
  
  void VU1Interpreter::resetScheduler()
  {
@@ -6246,13 +6307,13 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +            gate.next = std::numeric_limits<uint64_t>::max();
 +            gate.pendingCycles = 0;
 +            gate.due.fill(0);
-+            gate.useFullScan = false;
++            gate.useFullScan = !commitGateEnabled();
 +        }
 +    }
      m_flagPipeline = {};
      m_fdiv = {};
      m_efu = {};
-@@ -73,7 +281,7 @@ void VU1Interpreter::resetScheduler()
+@@ -73,7 +342,7 @@ void VU1Interpreter::resetScheduler()
      m_vfWritePipeline = {};
      m_viWritePipeline = {};
      m_accWritePipeline = {};
@@ -6261,7 +6322,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
      m_vfReady = {};
      m_viReady = {};
      m_accReady = {};
-@@ -197,12 +405,37 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+@@ -197,12 +466,37 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
  void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
                                           uint8_t laneFlags[4])
  {
@@ -6299,7 +6360,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
          long double exactResult = 0.0L;
          if (calculateFmacExactResult(component, exactResult))
          {
-@@ -494,25 +727,15 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -494,25 +788,15 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
      if (dest == 0u)
          return;
  
@@ -6334,63 +6395,63 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
  
      FlagPipelineEntry *entry = nullptr;
      for (FlagPipelineEntry &candidate : m_flagPipeline)
-@@ -533,6 +756,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -533,6 +817,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
      entry->valid = true;
      entry->issueCycle = m_cycle;
      entry->readyCycle = m_cycle + kFmacLatency;
-+    lowerCommitGate(this, m_cycle, entry->readyCycle, PipeKind::Flag, static_cast<size_t>(entry - m_flagPipeline.data()));
++    lowerCommitGate(m_cycle, entry->readyCycle, PipeKind::Flag, static_cast<size_t>(entry - m_flagPipeline.data()));
      entry->mac = mac;
      entry->status = status;
      entry->extraSticky = extraSticky;
-@@ -572,6 +796,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+@@ -572,6 +857,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
              entry.valid = true;
              entry.issueCycle = m_cycle;
              entry.readyCycle = m_cycle + kFmacLatency;
-+            lowerCommitGate(this, m_cycle, entry.readyCycle, PipeKind::Flag, static_cast<size_t>(&entry - m_flagPipeline.data()));
++            lowerCommitGate(m_cycle, entry.readyCycle, PipeKind::Flag, static_cast<size_t>(&entry - m_flagPipeline.data()));
              entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
              entry.writesSticky = true;
              return;
-@@ -591,6 +816,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+@@ -591,6 +877,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
              entry.valid = true;
              entry.issueCycle = m_cycle;
              entry.readyCycle = m_cycle + kFmacLatency;
-+            lowerCommitGate(this, m_cycle, entry.readyCycle, PipeKind::Flag, static_cast<size_t>(&entry - m_flagPipeline.data()));
++            lowerCommitGate(m_cycle, entry.readyCycle, PipeKind::Flag, static_cast<size_t>(&entry - m_flagPipeline.data()));
              entry.clip = m_workingClip;
              entry.writesClip = true;
              return;
-@@ -615,6 +841,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+@@ -615,6 +902,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
              entry.valid = true;
              entry.issueCycle = m_cycle;
              entry.readyCycle = m_cycle + kFmacLatency;
-+            lowerCommitGate(this, m_cycle, entry.readyCycle, PipeKind::Flag, static_cast<size_t>(&entry - m_flagPipeline.data()));
++            lowerCommitGate(m_cycle, entry.readyCycle, PipeKind::Flag, static_cast<size_t>(&entry - m_flagPipeline.data()));
              entry.clip = m_workingClip;
              entry.writesClip = true;
              return;
-@@ -629,6 +856,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+@@ -629,6 +917,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
      value = normalizeResult(value, ignoredFlags);
      m_fdiv.valid = true;
      m_fdiv.readyCycle = m_cycle + latency;
-+    lowerCommitGate(this, m_cycle, m_fdiv.readyCycle, PipeKind::Fdiv, 0);
++    lowerCommitGate(m_cycle, m_fdiv.readyCycle, PipeKind::Fdiv, 0);
      m_fdiv.value = value;
      m_fdiv.statusDi = statusDi & 0x30u;
  }
-@@ -643,6 +871,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+@@ -643,6 +932,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
          {
              entry.valid = true;
              entry.readyCycle = m_cycle + latency;
-+            lowerCommitGate(this, m_cycle, entry.readyCycle, PipeKind::Efu, static_cast<size_t>(&entry - m_efu.data()));
++            lowerCommitGate(m_cycle, entry.readyCycle, PipeKind::Efu, static_cast<size_t>(&entry - m_efu.data()));
              entry.value = value;
              // EFU throughput is one cycle shorter than result visibility.
              m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
-@@ -660,6 +889,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+@@ -660,6 +950,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
          {
              store.valid = true;
              store.readyCycle = m_cycle + 1u;
-+            lowerCommitGate(this, m_cycle, store.readyCycle, PipeKind::Store, static_cast<size_t>(&store - m_storePipeline.data()));
++            lowerCommitGate(m_cycle, store.readyCycle, PipeKind::Store, static_cast<size_t>(&store - m_storePipeline.data()));
              store.address = address;
              store.laneMask = laneMask;
              std::copy(words, words + 4, store.words.begin());
-@@ -674,24 +904,47 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+@@ -674,24 +965,47 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
  {
      if (reg == 0u || laneMask == 0u)
          return;
@@ -6409,7 +6470,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +        write.reg = reg;
 +        write.laneMask = laneMask;
 +        write.valid = true;
-+        lowerCommitGate(this, m_cycle, ready, PipeKind::Vf, static_cast<size_t>(&write - m_vfWritePipeline.data()));
++        lowerCommitGate(m_cycle, ready, PipeKind::Vf, static_cast<size_t>(&write - m_vfWritePipeline.data()));
 +
 +        // The same lanes acquire a new ready cycle and a new sequence number.
 +        if (laneMask == 0xFu)
@@ -6448,23 +6509,23 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
      }
      reportReservedInstruction(false, 0xFFFFFFF7u);
  }
-@@ -707,6 +960,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+@@ -707,6 +1021,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
-+            lowerCommitGate(this, m_cycle, write.readyCycle, PipeKind::Vi, static_cast<size_t>(&write - m_viWritePipeline.data()));
++            lowerCommitGate(m_cycle, write.readyCycle, PipeKind::Vi, static_cast<size_t>(&write - m_viWritePipeline.data()));
              write.sequence = ++m_nextWriteSequence;
              write.reg = reg;
              write.value = value;
-@@ -728,6 +982,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+@@ -728,6 +1043,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
-+            lowerCommitGate(this, m_cycle, write.readyCycle, PipeKind::Acc, static_cast<size_t>(&write - m_accWritePipeline.data()));
++            lowerCommitGate(m_cycle, write.readyCycle, PipeKind::Acc, static_cast<size_t>(&write - m_accWritePipeline.data()));
              write.sequence = ++m_nextWriteSequence;
              write.laneMask = laneMask;
              std::copy(value, value + 4, write.value.begin());
-@@ -744,11 +999,141 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+@@ -744,11 +1060,141 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
  
  void VU1Interpreter::commitReadyPipelines()
  {
@@ -6475,8 +6536,8 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +    static_assert(kMaxPendingVfWrites <= 16u);
 +    static_assert(kMaxPendingViWrites <= 8u);
 +    static_assert(kMaxPendingAccWrites <= 8u);
-+    CommitGate &gate = commitGateFor(this);
-+    const bool gated = commitGateEnabled() && &gate != &g_commitGateOverflow && !gate.useFullScan;
++    CommitGate &gate = *t_runningGate;
++    const bool gated = !gate.useFullScan;
 +    if (!gated)
      {
 -        if (!entry.valid || entry.readyCycle > m_cycle)
@@ -6487,7 +6548,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +        {
 +            if (!entry.valid || entry.readyCycle > m_cycle)
 +                continue;
- 
++
 +            if (entry.writesMac)
 +                m_state.mac = entry.mac;
 +            if (entry.writesStatus)
@@ -6580,7 +6641,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
 +
 +        return;
 +    }
-+
+ 
 +    if (m_cycle < gate.next)
 +        return;
 +
@@ -6609,7 +6670,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
          if (entry.writesMac)
              m_state.mac = entry.mac;
          if (entry.writesStatus)
-@@ -762,30 +1147,30 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -762,30 +1208,30 @@ void VU1Interpreter::commitReadyPipelines()
          }
          if (entry.writesClip)
              m_state.clip = entry.clip;
@@ -6652,7 +6713,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
          if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
          {
              uint32_t oldWords[4]{};
-@@ -797,13 +1182,13 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -797,13 +1243,13 @@ void VU1Interpreter::commitReadyPipelines()
              }
              std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
          }
@@ -6670,7 +6731,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
          for (uint32_t component = 0; component < 4u; ++component)
          {
              if ((write.laneMask & laneForComponent(component)) != 0u &&
-@@ -812,22 +1197,22 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -812,22 +1258,22 @@ void VU1Interpreter::commitReadyPipelines()
                  m_state.vf[write.reg][component] = write.value[component];
              }
          }
@@ -6701,7 +6762,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
          for (uint32_t component = 0; component < 4u; ++component)
          {
              if ((write.laneMask & laneForComponent(component)) != 0u &&
-@@ -836,10 +1221,12 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -836,10 +1282,12 @@ void VU1Interpreter::commitReadyPipelines()
                  m_state.acc[component] = write.value[component];
              }
          }
@@ -6715,7 +6776,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
  void VU1Interpreter::progressXgkick()
  {
      if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
-@@ -857,10 +1244,21 @@ void VU1Interpreter::progressXgkick()
+@@ -857,10 +1305,21 @@ void VU1Interpreter::progressXgkick()
          }
  
          const uint32_t qwordOffset = m_xgkick.copiedBytes;
@@ -6740,19 +6801,19 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
          }
          m_xgkick.copiedBytes += 16u;
  
-@@ -919,6 +1317,11 @@ void VU1Interpreter::finishXgkick()
+@@ -919,6 +1378,11 @@ void VU1Interpreter::finishXgkick()
      if (!m_xgkick.active)
          return;
  
-+    static const bool captureEnabled = std::getenv("PS2X_VU1_COLLAPSE_DUMP") != nullptr;
++    static const bool captureEnabled = vu1CaptureEnabled();
 +    if (captureEnabled && m_unit == Unit::VU1)
-+        captureCollapsedKick(m_xgkick.packet.data(), m_xgkick.totalBytes,
-+                             m_xgkick.sourceAddress, m_xgkick.issueCycle, m_state);
++        captureKick(m_xgkick.packet.data(), m_xgkick.totalBytes,
++                    m_xgkick.sourceAddress, m_xgkick.issueCycle, m_state);
 +
      if (m_activeMemory)
          m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
      else if (m_activeGs)
-@@ -931,12 +1334,17 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+@@ -931,12 +1395,17 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
      if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
          return;
  
@@ -6774,12 +6835,12 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
  }
  
  void VU1Interpreter::advanceOneCycle()
-@@ -951,8 +1359,23 @@ void VU1Interpreter::advanceOneCycle()
+@@ -951,8 +1420,23 @@ void VU1Interpreter::advanceOneCycle()
  
  void VU1Interpreter::advanceTo(uint64_t targetCycle)
  {
-+    CommitGate &gate = commitGateFor(this);
-+    const bool gated = commitGateEnabled() && &gate != &g_commitGateOverflow && !gate.useFullScan;
++    CommitGate &gate = *t_runningGate;
++    const bool gated = !gate.useFullScan;
      while (m_cycle < targetCycle)
 -        advanceOneCycle();
 +    {
@@ -6799,7 +6860,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
  }
  
  bool VU1Interpreter::pipelinesPending() const
-@@ -1005,15 +1428,19 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+@@ -1005,15 +1489,19 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
                      ready = std::max(ready, m_vfReady[access.reg][component]);
              }
          }
@@ -6825,7 +6886,7 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
          }
      }
  
-@@ -1036,37 +1463,13 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+@@ -1036,37 +1524,13 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
  
  void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
  {
@@ -6868,18 +6929,38 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
      }
      for (uint32_t component = 0; component < 4u; ++component)
      {
-@@ -1629,13 +2032,34 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1605,6 +2069,9 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+     m_state.vf[0][1] = 0.0f;
+     m_state.vf[0][2] = 0.0f;
+     m_state.vf[0][3] = 1.0f;
++    static const bool captureEnabled = vu1CaptureEnabled();
++    if (captureEnabled && m_unit == Unit::VU1)
++        vu1Capture().starting = true;
+     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+ }
+ 
+@@ -1624,22 +2091,68 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
+ {
++    const ScopedCommitGate activeGate(this);
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
      m_activeGs = &gs;
      m_activeMemory = memory;
  
-+    static const bool captureEnabled = std::getenv("PS2X_VU1_COLLAPSE_DUMP") != nullptr;
++    static const bool captureEnabled = vu1CaptureEnabled();
 +    if (captureEnabled && m_unit == Unit::VU1)
 +    {
-+        auto &capture = collapseCapture();
-+        capture.armed = capture.path && capture.path[0] != '\0' && vuCode && vuData &&
-+                        codeSize <= capture.code.size() && dataSize <= capture.data.size() &&
-+                        capture.written < 12u &&
-+                        (capture.written == 0u || capture.lastFrame != g_ps2xFrameNo);
++        auto &capture = vu1Capture();
++        // Resumed programs need pending pipeline state as well as registers.
++        const bool selected = capture.sample
++                                  ? sampleVu1Program(capture)
++                                  : capture.written < 12u &&
++                                        (capture.written == 0u || capture.lastFrame != g_ps2xFrameNo);
++        capture.starting = false;
++        capture.armed = selected && capture.path && capture.path[0] != '\0' && vuCode && vuData &&
++                        codeSize <= capture.code.size() && dataSize <= capture.data.size();
 +        if (capture.armed)
 +        {
 +            capture.initialState = m_state;
@@ -6893,6 +6974,10 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
      const int previousRoundingMode = std::fegetround();
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
++    const bool isVu1 = m_unit == Unit::VU1;
++    const bool trackedCode = memory &&
++                             vuCode == (isVu1 ? memory->getVU1Code() : memory->getVU0Code());
++    DecodedInstructionPair uncached;
      bool programEnded = false;
 +    // The first issue may follow a resume. After that, advancing the clock
 +    // has already committed the ready results before each issue.
@@ -6904,7 +6989,28 @@ index f19e281f18c51e5e328b265ac10996e5391122cc..cd99e8d5881a0354d8e681f305ce99ed
          if (m_state.pc + 8u > codeSize)
              break;
  
-@@ -1655,22 +2079,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
++        const uint32_t pc = m_state.pc;
++        const uint32_t pairIndex = pc / 8u;
++        const DecodedInstructionPair *pair;
++        if (trackedCode && (pc & 7u) == 0u && pairIndex < kMaxDecodedPairs)
++        {
++            const uint64_t generation = isVu1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
++            if (!m_decodedCodeCacheValid || m_cachedVuCode != vuCode || m_cachedMemory != memory ||
++                m_cachedCodeSize != codeSize || m_cachedCodeGeneration != generation)
++                rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
++            pair = &m_decodedCodeCache[pairIndex];
++        }
++        else
++        {
++            uncached = getDecodedInstructionPairForPc(vuCode, codeSize, memory, pc);
++            pair = &uncached;
++        }
++        const DecodedInstructionPair &decoded = *pair;
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+@@ -1655,22 +2168,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                  break;
              }
              advanceTo(readyCycle);

@@ -128,11 +128,27 @@ log recorded decoded 512×448 frames from both movie handles.
 The Release build passed a regression check using the stale work-buffer values from
 the capture. The issue and the fix were verified on the same Windows setup.
 
+## Milestone 6: faster VU1 execution in a busy cutscene (2026-11-27)
+
+As the camera tilted from the sky into the scenery, the matching busy stretch drew
+about 8,500 primitives and ran about 1,130 VU1 programs per display flip. VU1
+accounted for about 72% of game-thread samples during the slowdown.
+
+The interpreter now reuses cached instruction pairs directly and selects the
+retirement schedule once per program run. The same 96 captured VU1 programs
+produced identical GIF packets and final state in replay. The median replay
+time fell from 1.20 s to 1.09 s across eight paired measurements. All 40 VU1 tests
+passed with the retirement optimization enabled and disabled.
+
+In one matched Windows Release comparison, the median display upload rate rose
+from 4.59 to 5.28 per second. The cutscene played through and the most demanding
+section remains slow.
+
 ## Next
 
 * Investigate the remaining hair deformation and motion.
-* Improve performance in busy scenes. Profile a representative slow shot and correlate
-  it with the amount of work submitted to VU1 and the GS.
+* Improve performance in busy scenes. Use the captured camera pan to check further
+  changes to VU1 instruction execution.
 * Check the delay before the title screen accepts input.
 * Verify audio beyond the narration, controller input, and memory-card use.
 * Address remaining oversized generated functions and unresolved jump tables.

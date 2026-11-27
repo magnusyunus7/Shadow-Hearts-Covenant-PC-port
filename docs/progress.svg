@@ -59,7 +59,7 @@
 <text x="856" y="618" fill="#8b949e" font-size="13" text-anchor="end">partial - narration audible, full audio still unverified</text>
 <circle cx="52" cy="639" r="6" fill="#d29922"/>
 <text x="68" y="644" fill="#e6edf3" font-size="14">Speed</text>
-<text x="856" y="644" fill="#8b949e" font-size="13" text-anchor="end">partial - room measurements about 5 to 13 uploads per second</text>
+<text x="856" y="644" fill="#8b949e" font-size="13" text-anchor="end">partial - busy cutscene median rose from 4.59 to 5.28 uploads per second</text>
 <circle cx="52" cy="665" r="6" fill="#484f58"/>
 <text x="68" y="670" fill="#e6edf3" font-size="14">Memory card</text>
 <text x="856" y="670" fill="#8b949e" font-size="13" text-anchor="end">not yet</text>

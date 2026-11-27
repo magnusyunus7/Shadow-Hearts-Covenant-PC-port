@@ -18,7 +18,7 @@
     {"name": "Movies (MPEG)", "state": "partial", "note": "story movies before and after the first room play"},
     {"name": "Input", "state": "partial", "note": "keyboard verified; controller mapped, untested"},
     {"name": "Sound", "state": "partial", "note": "narration audible, full audio still unverified"},
-    {"name": "Speed", "state": "partial", "note": "room measurements about 5 to 13 uploads per second"},
+    {"name": "Speed", "state": "partial", "note": "busy cutscene median rose from 4.59 to 5.28 uploads per second"},
     {"name": "Memory card", "state": "todo"}
   ]
 }
