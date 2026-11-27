@@ -144,9 +144,22 @@ In one matched Windows Release comparison, the median display upload rate rose
 from 4.59 to 5.28 per second. The cutscene played through and the most demanding
 section remains slow.
 
+## Milestone 7: correct hair rotation in the first room (2026-11-27)
+
+The hair pose routine computed its normalization input in $f3. The recompiler
+translated the EE SQRT.S instruction using fs, so that instruction took the
+root of $f0, which still held 1.0. SQRT.S reads ft on the EE. The translator
+and the four affected runner files were corrected.
+
+An offline replay rebuilt the pose from each of three captures. The old code
+stretched a hair bone axis to 2.40 times its unit length in the worst capture.
+After the fix, the tested axes were within 0.02% of unit length in all three
+captures. All eight floating-point tests passed, and the Windows Release
+playtester confirmed that the hair looks right in the room cutscene.
+
 ## Next
 
-* Investigate the remaining hair deformation and motion.
+* Play past the camera pan into the first controllable area and verify the first battle.
 * Improve performance in busy scenes. Use the captured camera pan to check further
   changes to VU1 instruction execution.
 * Check the delay before the title screen accepts input.

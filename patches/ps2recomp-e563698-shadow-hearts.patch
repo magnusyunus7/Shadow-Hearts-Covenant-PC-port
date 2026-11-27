@@ -1421,6 +1421,20 @@ index b49815540952427b724770b5a9555994b5de99d7..042be0ed5e04cab5fe92e5163f325f5e
      void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
      {
          for (auto &service : m_impl->coreServices)
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 435db3aa9367d8571161577ddfaadbe8e355f759..fed348b36dfee3aec1551d308dbb8e832963f444 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -58,7 +58,8 @@ namespace ps2recomp
+                                    "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]); }}",
+                                    ft, fd, fs, ft);
+             case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++                // The EE encodes the radicand in ft.
++                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
 diff --git a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
 index a2bcb777f61068df569c0a20ef84e7dd57235239..39d1ec2dcd4d5b575c3e5c6f3e8d63e18270181b 100644
 --- a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
@@ -7229,6 +7243,30 @@ index 69742546fe840ca18a1a73bba2421d00499e1174..350f3582bcdf0983a6c0da4136b152da
          default:
              reportReservedInstruction(true, instr);
              return;
+diff --git a/ps2xTest/src/ps2_float_semantics_tests.cpp b/ps2xTest/src/ps2_float_semantics_tests.cpp
+index 2866d2bff38f63bc1049d4b94d487b019ae1b7c4..d00293be4f313b4da40af8e95182c4d51cbbac76 100644
+--- a/ps2xTest/src/ps2_float_semantics_tests.cpp
++++ b/ps2xTest/src/ps2_float_semantics_tests.cpp
+@@ -210,7 +210,7 @@ void register_ps2_float_semantics_tests()
+             t.Equals(laneBits(flushed, 3), bitsOf(0.5f), "lane 3: 1 * 0.5 should be 0.5");
+         });
+ 
+-        tc.Run("DIV.S and RSQRT.S translate to the PS2 semantics helpers", [](TestCase &t)
++        tc.Run("DIV.S, SQRT.S and RSQRT.S translate with the correct EE operands", [](TestCase &t)
+         {
+             CodeGenerator gen({}, {});
+ 
+@@ -220,6 +220,10 @@ void register_ps2_float_semantics_tests()
+                      "DIV.S should write fs / ft to fd but got: " + div);
+             t.IsTrue(div.find("INFINITY") == std::string::npos, "DIV.S must not produce IEEE infinity but got: " + div);
+ 
++            const std::string sqrt = gen.translateInstruction(makeCop1S(COP1_S_SQRT, 2, 0, 4));
++            t.IsTrue(sqrt.find("ctx->f[2] = FPU_SQRT_S(ctx->f[4])") != std::string::npos,
++                     "SQRT.S should read ft but got: " + sqrt);
++
+             const std::string rsqrt = gen.translateInstruction(makeCop1S(COP1_S_RSQRT, 2, 3, 4));
+             t.IsTrue(rsqrt.find("ctx->f[2] = FPU_RSQRT_S(ctx->f[3], ctx->f[4])") != std::string::npos,
+                      "RSQRT.S should compute fs / sqrt(ft) but got: " + rsqrt);
 diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 index 4772f3fb772deec963ded9e93fc82d116f1ed441..ac4d4f15e83fd0aec0c6922f2c343a6882a4cdde 100644
 --- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp

@@ -47,7 +47,7 @@
 <text x="856" y="514" fill="#8b949e" font-size="13" text-anchor="end">done - main + 3 overlays + ZMAIN bank</text>
 <circle cx="52" cy="535" r="6" fill="#d29922"/>
 <text x="68" y="540" fill="#e6edf3" font-size="14">Graphics (GS / VU1)</text>
-<text x="856" y="540" fill="#8b949e" font-size="13" text-anchor="end">partial - room characters move properly, hair still needs work</text>
+<text x="856" y="540" fill="#8b949e" font-size="13" text-anchor="end">partial - room character animation and hair verified</text>
 <circle cx="52" cy="561" r="6" fill="#d29922"/>
 <text x="68" y="566" fill="#e6edf3" font-size="14">Movies (MPEG)</text>
 <text x="856" y="566" fill="#8b949e" font-size="13" text-anchor="end">partial - story movies before and after the first room play</text>

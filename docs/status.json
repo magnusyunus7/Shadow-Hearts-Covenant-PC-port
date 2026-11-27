@@ -14,7 +14,7 @@
   ],
   "systems": [
     {"name": "Game code (recompiled)", "state": "done", "note": "main + 3 overlays + ZMAIN bank"},
-    {"name": "Graphics (GS / VU1)", "state": "partial", "note": "room characters move properly, hair still needs work"},
+    {"name": "Graphics (GS / VU1)", "state": "partial", "note": "room character animation and hair verified"},
     {"name": "Movies (MPEG)", "state": "partial", "note": "story movies before and after the first room play"},
     {"name": "Input", "state": "partial", "note": "keyboard verified; controller mapped, untested"},
     {"name": "Sound", "state": "partial", "note": "narration audible, full audio still unverified"},
