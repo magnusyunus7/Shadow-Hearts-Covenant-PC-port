@@ -2769,7 +2769,7 @@ index b1bb6d85151f5c997e46819e3fc021c45d119d36..f713c294fc93688ce5859e3de091c009
          }
  
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index 44eaef4d9ccb39201587080b983be3fbb78992c0..567406b58a4ff6a0256bfc403812b5c09983bd17 100644
+index 44eaef4d9ccb39201587080b983be3fbb78992c0..23e6d2ac27709037cf2e42124e421e997a4efebe 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 @@ -1,5 +1,6 @@
@@ -2941,7 +2941,18 @@ index 44eaef4d9ccb39201587080b983be3fbb78992c0..567406b58a4ff6a0256bfc403812b5c0
      void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
          const uint32_t mpegAddr = getRegU32(ctx, 4);
-@@ -2307,6 +2424,68 @@ namespace ps2_stubs
+@@ -2028,7 +2145,10 @@ namespace ps2_stubs
+         mpegGuestWrite64(rdram, param_1 + 0x30, 0xFFFFFFFFFFFFFFFFULL);
+         mpegGuestWrite64(rdram, param_1 + 0x38, 0);
+ 
++        // Create must reset the same guest-visible status words as sceMpegReset.
++        // Callers can reuse dirty work RAM, and guest sceMpegIsEnd reads offset zero.
+         static const unsigned s_zeroOffsets[] = {
++            0x00, 0x04, 0x08,
+             0xB4, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC, 0xD0, 0xD4, 0xD8, 0xDC, 0xE0, 0xE4, 0xE8, 0xF8,
+             0x0C, 0x14, 0x2C, 0x34, 0x3C,
+             0x48, 0xFC, 0x100, 0x104, 0x70, 0x90, 0xAC};
+@@ -2307,6 +2427,68 @@ namespace ps2_stubs
                      });
                      ++g_mpeg_stub_state.getPictureWaitTraceCount;
                  }
@@ -3010,7 +3021,16 @@ index 44eaef4d9ccb39201587080b983be3fbb78992c0..567406b58a4ff6a0256bfc403812b5c0
                  lock.unlock();
                  runtime->eeScheduler().waitExternal(
                      EeWaitReason::Mpeg,
-@@ -2406,13 +2585,30 @@ namespace ps2_stubs
+@@ -2369,7 +2551,7 @@ namespace ps2_stubs
+                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
+                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
+                 haveFrame = true;
+-                if (g_mpeg_stub_state.pictureTraceCount < 32u)
++                if (frameCount == 0u || g_mpeg_stub_state.pictureTraceCount < 32u)
+                 {
+                     PS2_IF_AGRESSIVE_LOGS({
+                         std::cerr << "[MPEG:GetPicture:FRAME] mpeg=0x" << std::hex << mpegAddr
+@@ -2406,13 +2588,30 @@ namespace ps2_stubs
              }
          }
  
@@ -7103,3 +7123,28 @@ index 69742546fe840ca18a1a73bba2421d00499e1174..350f3582bcdf0983a6c0da4136b152da
          default:
              reportReservedInstruction(true, instr);
              return;
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index 4772f3fb772deec963ded9e93fc82d116f1ed441..ac4d4f15e83fd0aec0c6922f2c343a6882a4cdde 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -721,6 +721,7 @@ void register_ps2_runtime_expansion_tests()
+                      "new CD stream demux should allow callbacks on a reused MPEG handle");
+ 
+             constexpr uint32_t kMpegWorkAddr = 0x00130000u;
++            std::memset(rdram.data() + kMpegWorkAddr, 0xA5, 3u * sizeof(uint32_t));
+             R5900Context createCtx{};
+             setRegU32(createCtx, 4, kMpegAddr);
+             setRegU32(createCtx, 5, kMpegWorkAddr);
+@@ -728,6 +729,12 @@ void register_ps2_runtime_expansion_tests()
+             ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, &runtime);
+             t.IsTrue(::getRegU32(&createCtx, 2) != 0u,
+                      "sceMpegCreate should reopen the MPEG handle after an ended reset");
++            t.Equals(Ps2FastRead32(rdram.data(), kMpegWorkAddr), 0u,
++                     "sceMpegCreate should clear the guest end-of-stream word in reused work RAM");
++            t.Equals(Ps2FastRead32(rdram.data(), kMpegWorkAddr + 4u), 0u,
++                     "sceMpegCreate should clear the guest reference buffer status");
++            t.Equals(Ps2FastRead32(rdram.data(), kMpegWorkAddr + 8u), 0u,
++                     "sceMpegCreate should clear the remaining guest reset status");
+ 
+             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+             prepareCallbackDispatch();

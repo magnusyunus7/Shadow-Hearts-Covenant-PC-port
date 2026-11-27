@@ -2,10 +2,10 @@
   "updated": "2026-11-27",
   "milestones": [
     {"name": "Boots (disclaimer + title logo)", "state": "done"},
-    {"name": "Opening movie", "state": "partial", "note": "decodes and is skippable; picture not shown yet"},
+    {"name": "Pre-room story movie", "state": "done", "note": "picture and playback verified"},
     {"name": "Title screen + New Game", "state": "done"},
     {"name": "First in-engine 3D scene", "state": "done", "note": "room plays through with improved character animation"},
-    {"name": "Post-room story scene", "state": "partial", "note": "freezes after narration begins, can skip and continue"},
+    {"name": "Post-room story scene", "state": "done", "note": "1915 movie playback verified"},
     {"name": "Walk around the first area", "state": "todo"},
     {"name": "First battle", "state": "todo"},
     {"name": "Save and load (memory card)", "state": "todo"},
@@ -15,7 +15,7 @@
   "systems": [
     {"name": "Game code (recompiled)", "state": "done", "note": "main + 3 overlays + ZMAIN bank"},
     {"name": "Graphics (GS / VU1)", "state": "partial", "note": "room characters move properly, hair still needs work"},
-    {"name": "Movies (MPEG)", "state": "partial", "note": "opening decode works, post-room display needs investigation"},
+    {"name": "Movies (MPEG)", "state": "partial", "note": "story movies before and after the first room play"},
     {"name": "Input", "state": "partial", "note": "keyboard verified; controller mapped, untested"},
     {"name": "Sound", "state": "partial", "note": "narration audible, full audio still unverified"},
     {"name": "Speed", "state": "partial", "note": "room measurements about 5 to 13 uploads per second"},

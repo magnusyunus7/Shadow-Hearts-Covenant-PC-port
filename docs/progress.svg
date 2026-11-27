@@ -4,24 +4,24 @@
 <text x="876" y="44" fill="#8b949e" font-size="13" text-anchor="end">updated 2026-11-27 - green = done, amber = partial (counts half), grey = not yet</text>
 <rect x="24" y="70" width="852" height="346" rx="8" fill="#161b22" stroke="#30363d"/>
 <text x="44" y="102" fill="#e6edf3" font-size="20" font-weight="600">Story milestones</text>
-<text x="856" y="102" fill="#e6edf3" font-size="20" font-weight="600" text-anchor="end">40%</text>
+<text x="856" y="102" fill="#e6edf3" font-size="20" font-weight="600" text-anchor="end">50%</text>
 <rect x="44" y="114" width="812" height="10" rx="5" fill="#21262d"/>
-<rect x="44" y="114" width="324.8" height="10" rx="5" fill="#3fb950"/>
+<rect x="44" y="114" width="406.0" height="10" rx="5" fill="#3fb950"/>
 <circle cx="52" cy="147" r="6" fill="#3fb950"/>
 <text x="68" y="152" fill="#e6edf3" font-size="14">Boots (disclaimer + title logo)</text>
 <text x="856" y="152" fill="#8b949e" font-size="13" text-anchor="end">done</text>
-<circle cx="52" cy="173" r="6" fill="#d29922"/>
-<text x="68" y="178" fill="#e6edf3" font-size="14">Opening movie</text>
-<text x="856" y="178" fill="#8b949e" font-size="13" text-anchor="end">partial - decodes and is skippable; picture not shown yet</text>
+<circle cx="52" cy="173" r="6" fill="#3fb950"/>
+<text x="68" y="178" fill="#e6edf3" font-size="14">Pre-room story movie</text>
+<text x="856" y="178" fill="#8b949e" font-size="13" text-anchor="end">done - picture and playback verified</text>
 <circle cx="52" cy="199" r="6" fill="#3fb950"/>
 <text x="68" y="204" fill="#e6edf3" font-size="14">Title screen + New Game</text>
 <text x="856" y="204" fill="#8b949e" font-size="13" text-anchor="end">done</text>
 <circle cx="52" cy="225" r="6" fill="#3fb950"/>
 <text x="68" y="230" fill="#e6edf3" font-size="14">First in-engine 3D scene</text>
 <text x="856" y="230" fill="#8b949e" font-size="13" text-anchor="end">done - room plays through with improved character animation</text>
-<circle cx="52" cy="251" r="6" fill="#d29922"/>
+<circle cx="52" cy="251" r="6" fill="#3fb950"/>
 <text x="68" y="256" fill="#e6edf3" font-size="14">Post-room story scene</text>
-<text x="856" y="256" fill="#8b949e" font-size="13" text-anchor="end">partial - freezes after narration begins, can skip and continue</text>
+<text x="856" y="256" fill="#8b949e" font-size="13" text-anchor="end">done - 1915 movie playback verified</text>
 <circle cx="52" cy="277" r="6" fill="#484f58"/>
 <text x="68" y="282" fill="#e6edf3" font-size="14">Walk around the first area</text>
 <text x="856" y="282" fill="#8b949e" font-size="13" text-anchor="end">not yet</text>
@@ -50,7 +50,7 @@
 <text x="856" y="540" fill="#8b949e" font-size="13" text-anchor="end">partial - room characters move properly, hair still needs work</text>
 <circle cx="52" cy="561" r="6" fill="#d29922"/>
 <text x="68" y="566" fill="#e6edf3" font-size="14">Movies (MPEG)</text>
-<text x="856" y="566" fill="#8b949e" font-size="13" text-anchor="end">partial - opening decode works, post-room display needs investigation</text>
+<text x="856" y="566" fill="#8b949e" font-size="13" text-anchor="end">partial - story movies before and after the first room play</text>
 <circle cx="52" cy="587" r="6" fill="#d29922"/>
 <text x="68" y="592" fill="#e6edf3" font-size="14">Input</text>
 <text x="856" y="592" fill="#8b949e" font-size="13" text-anchor="end">partial - keyboard verified; controller mapped, untested</text>

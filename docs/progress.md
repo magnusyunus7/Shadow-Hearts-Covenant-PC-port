@@ -115,12 +115,24 @@ in the heaviest room stretch and about 13 in lighter sections. VU1 dominated the
 stretches. The source patch includes the VU1 scheduling and arithmetic optimizations used
 in those runs.
 
+## Milestone 5: story movies around the first room (2026-11-27)
+
+Windows Release playback now works for the previously black movie before the room
+and the “1915” movie afterward. The playtester continued beyond both scenes. The run
+log recorded decoded 512×448 frames from both movie handles.
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| 30 | Black movie before the first room and a stalled “1915” subtitle after it | `sceMpegCreate` left three status words in reused MPEG work RAM. A nonzero word at offset zero made guest `sceMpegIsEnd` report end-of-stream before the first picture. | Clear the guest status words when creating a movie. |
+
+The Release build passed a regression check using the stale work-buffer values from
+the capture. The issue and the fix were verified on the same Windows setup.
+
 ## Next
 
 * Investigate the remaining hair deformation and motion.
-* The scene after the room appears frozen after the narrator says “1915.” Skipping it
-  allows the game to continue. Capture the affected frame and its GIF commands.
-* Check the delay before the title screen accepts input and verify opening movie playback.
+* Improve performance in busy scenes. Profile a representative slow shot and correlate
+  it with the amount of work submitted to VU1 and the GS.
+* Check the delay before the title screen accepts input.
 * Verify audio beyond the narration, controller input, and memory-card use.
-* Improve performance in the heaviest scenes and address remaining oversized generated
-  functions and unresolved jump tables.
+* Address remaining oversized generated functions and unresolved jump tables.
